@@ -657,6 +657,7 @@ SH
 chmod +x "$tmp_doc"
 
 cat >"$tmp_chat" <<'PY'
+#!/usr/bin/env python3
 import os, sys, json, re, html
 from html.parser import HTMLParser
 from datetime import datetime, timezone
@@ -898,6 +899,7 @@ def main():
 if __name__ == "__main__":
   raise SystemExit(main())
 PY
+chmod +x "$tmp_chat"
 
 # Enumerate all files (always include hidden, so verbose can report hidden-excluded counts)
 : >"$tmp_all"
@@ -1025,7 +1027,8 @@ def should_route_chat(path: str, ext: str, lazy_sniff) -> bool:
   base = os.path.basename(p_low)
 
   if ext in CHAT_HTML_EXTS:
-    return True
+    data = lazy_sniff()
+    return looks_like_telegram_html(data)
 
   if ext in CHAT_JSON_EXTS:
     if base.startswith(("message", "messages", "result")) or "messages" in p_low:
@@ -1314,7 +1317,7 @@ if [[ "$LOUD" -eq 0 && "$VERBOSE" -eq 0 ]]; then
   RG_BASE+=(--no-messages)
 fi
 
-RG_CHAT=("${RG_BASE[@]}" --pre "python3 $tmp_chat" -- "$PATTERN")
+RG_CHAT=("${RG_BASE[@]}" --pre "$tmp_chat" -- "$PATTERN")
 RG_TEXT=("${RG_BASE[@]}" -- "$PATTERN")
 RG_RICH=("${RG_BASE[@]}" --pre "$RGA_PREPROC" -- "$PATTERN")
 
