@@ -1058,8 +1058,7 @@ def should_route_chat(path: str, ext: str, lazy_sniff) -> bool:
   base = os.path.basename(p_low)
 
   if ext in CHAT_HTML_EXTS:
-    data = lazy_sniff()
-    return looks_like_telegram_html(data)
+    return True
 
   if ext in CHAT_JSON_EXTS:
     if base.startswith(("message", "messages", "result")) or "messages" in p_low:
