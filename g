@@ -1103,12 +1103,11 @@ with open(out_text, "wb") as ft, open(out_rich, "wb") as fr, open(out_chat, "wb"
       bad.append(f"skip-office-temp(~$): {p}")
       continue
 
-    sniff_data = None
+    sniff_data = [None]
     def lazy_sniff():
-      nonlocal sniff_data
-      if sniff_data is None:
-        sniff_data = sniff(p)
-      return sniff_data
+      if sniff_data[0] is None:
+        sniff_data[0] = sniff(p)
+      return sniff_data[0]
 
     if chat_mode and should_route_chat(p, ext, lazy_sniff):
       sd["attempted"] += 1
