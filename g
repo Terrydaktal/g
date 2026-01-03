@@ -211,6 +211,7 @@ shift $((OPTIND - 1))
 if [[ "$UCOUNT" -ge 1 ]]; then SEARCH_HIDDEN=1; fi
 if [[ "$UCOUNT" -ge 2 ]]; then NO_IGNORE=1; fi
 if [[ "$UCOUNT" -ge 3 ]]; then SEARCH_BINARY=1; SEARCH_UUU=1; fi
+export CHAT_KEEP_TS
 
 install_if_missing rg ripgrep
 install_if_missing fd fd-find fdfind
@@ -1313,7 +1314,7 @@ if [[ "$LOUD" -eq 0 && "$VERBOSE" -eq 0 ]]; then
   RG_BASE+=(--no-messages)
 fi
 
-RG_CHAT=("${RG_BASE[@]}" --pre "CHAT_KEEP_TS=$CHAT_KEEP_TS python3 $tmp_chat" -- "$PATTERN")
+RG_CHAT=("${RG_BASE[@]}" --pre "python3 $tmp_chat" -- "$PATTERN")
 RG_TEXT=("${RG_BASE[@]}" -- "$PATTERN")
 RG_RICH=("${RG_BASE[@]}" --pre "$RGA_PREPROC" -- "$PATTERN")
 
