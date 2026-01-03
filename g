@@ -1172,10 +1172,10 @@ fi
 
 MIN_RICH_SIZE=128
 if [[ "$VERBOSE" -eq 1 || "$LOUD" -eq 1 ]]; then
-  python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
+  python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
     "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" "$CHAT_MODE" 2>&1 | tee -a "$DEBUG_LOG" >&2
 else
-  python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
+  python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
     "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" "$CHAT_MODE" 2>>"$DEBUG_LOG" >/dev/null || true
 fi
 
