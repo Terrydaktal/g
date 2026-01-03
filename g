@@ -8,6 +8,8 @@ AFTER=10
 VERBOSE=0
 LOUD=0
 AUDIT=0
+CHAT_MODE=0
+CHAT_KEEP_TS=1
 
 SEARCH_HIDDEN=0
 SEARCH_UUU=0
@@ -63,6 +65,8 @@ Options:
   -C N           set both -B and -A to N
   -v             verbose (debug log + end-of-run per-extension scan summary)
   --loud         show extractor/preprocessor messages
+  --chat         normalize supported chat exports before searching
+  --chat-ts=VAL  keep (keep) or drop (drop) timestamps in chat output (default: keep)
   -h, --help     help
 EOF
 }
@@ -152,6 +156,15 @@ for idx in "${!args[@]}"; do
     --no_ignore|--no-ignore) NO_IGNORE=1; continue ;;
     --whitelist) EXT_FILTER_MODE="whitelist"; continue ;;
     --blacklist) EXT_FILTER_MODE="blacklist"; continue ;;
+    --chat) CHAT_MODE=1; continue ;;
+    --chat-ts=*)
+      val="${arg#*=}"
+      case "$val" in
+        keep) CHAT_KEEP_TS=1 ;;
+        drop) CHAT_KEEP_TS=0 ;;
+        *) echo "Error: unknown value for --chat-ts (use keep|drop)" >&2; exit 2 ;;
+      esac
+      continue ;;
   esac
   filtered+=("$arg")
 done
@@ -176,6 +189,15 @@ while getopts ":B:A:C:vhu-:" opt; do
         no_ignore|no-ignore) NO_IGNORE=1 ;;
         whitelist) EXT_FILTER_MODE="whitelist" ;;
         blacklist) EXT_FILTER_MODE="blacklist" ;;
+        chat) CHAT_MODE=1 ;;
+        chat-ts=*)
+          val="${OPTARG#*=}"
+          case "$val" in
+            keep) CHAT_KEEP_TS=1 ;;
+            drop) CHAT_KEEP_TS=0 ;;
+            *) echo "Error: unknown value for --chat-ts (use keep|drop)" >&2; usage; exit 2 ;;
+          esac
+          ;;
         *) echo "Error: unknown option --${OPTARG}" >&2; usage; exit 2 ;;
       esac
       ;;
@@ -351,12 +373,14 @@ tmp_split="$(mktemp -t g_split.XXXXXX.py)"
 tmp_xlsx="$(mktemp -t g_xlsx.XXXXXX.py)"
 tmp_pptx="$(mktemp -t g_pptx.XXXXXX.py)"
 tmp_doc="$(mktemp -t g_doc.XXXXXX.sh)"
+tmp_chat="$(mktemp -t g_chat.XXXXXX.py)"
 tmp_vsum="$(mktemp -t g_vsum.XXXXXX.py)"
 tmp_failparse="$(mktemp -t g_failparse.XXXXXX.py)"
 
 tmp_all="$(mktemp -t g_all.XXXXXX.bin)"
 tmp_text="$(mktemp -t g_text.XXXXXX.bin)"
 tmp_rich="$(mktemp -t g_rich.XXXXXX.bin)"
+tmp_chat_list="$(mktemp -t g_chat_list.XXXXXX.bin)"
 tmp_xlsx_list="$(mktemp -t g_xlsx_list.XXXXXX.bin)"
 tmp_pptx_list="$(mktemp -t g_pptx_list.XXXXXX.bin)"
 tmp_doc_list="$(mktemp -t g_doc_list.XXXXXX.bin)"
@@ -370,6 +394,7 @@ tmp_shards_root="$(mktemp -d -t g_shards_root.XXXXXX)"
 
 tmp_err_text="$(mktemp -t g_err_text.XXXXXX.txt)"
 tmp_err_rich="$(mktemp -t g_err_rich.XXXXXX.txt)"
+tmp_err_chat="$(mktemp -t g_err_chat.XXXXXX.txt)"
 tmp_err_xlsx="$(mktemp -t g_err_xlsx.XXXXXX.txt)"
 tmp_err_pptx="$(mktemp -t g_err_pptx.XXXXXX.txt)"
 tmp_err_doc="$(mktemp -t g_err_doc.XXXXXX.txt)"
@@ -377,6 +402,7 @@ tmp_err_doc="$(mktemp -t g_err_doc.XXXXXX.txt)"
 BAD_RICH_PERSIST="${DEBUG_LOG}.bad_rich.txt"
 
 FAIL_TEXT_PERSIST="${DEBUG_LOG}.fail_text.txt"
+FAIL_CHAT_PERSIST="${DEBUG_LOG}.fail_chat.txt"
 FAIL_RICH_PERSIST="${DEBUG_LOG}.fail_rich.txt"
 FAIL_XLSX_PERSIST="${DEBUG_LOG}.fail_xlsx.txt"
 FAIL_PPTX_PERSIST="${DEBUG_LOG}.fail_pptx.txt"
@@ -385,9 +411,10 @@ FAIL_DOC_PERSIST="${DEBUG_LOG}.fail_doc.txt"
 cleanup() {
   [[ "${BASHPID:-$$}" -eq "$MAIN_BASHPID" ]] || return 0
   rm -f "$tmp_fmt" "$tmp_split" "$tmp_xlsx" "$tmp_pptx" "$tmp_doc" "$tmp_vsum" "$tmp_failparse" \
-        "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" \
+        "$tmp_chat" \
+        "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" \
         "$tmp_bad_rich" "$tmp_stats_json" "$tmp_rc2" "$tmp_mc" \
-        "$tmp_err_text" "$tmp_err_rich" "$tmp_err_xlsx" "$tmp_err_pptx" "$tmp_err_doc"
+        "$tmp_err_text" "$tmp_err_rich" "$tmp_err_chat" "$tmp_err_xlsx" "$tmp_err_pptx" "$tmp_err_doc"
   rm -rf "$tmp_shards_root"
 }
 trap cleanup EXIT
@@ -628,6 +655,249 @@ exit 2
 SH
 chmod +x "$tmp_doc"
 
+cat >"$tmp_chat" <<'PY'
+import os, sys, json, re, html
+from html.parser import HTMLParser
+from datetime import datetime, timezone
+
+KEEP_TS = os.environ.get("CHAT_KEEP_TS", "1").lower() not in {"0", "false", "no", "off"}
+
+def norm_text(s: str) -> str:
+  return " ".join((s or "").replace("\r", "").replace("\n", " ").split())
+
+def emit_line(ts: str, sender: str, source: str, text: str, msg_id=None):
+  pieces = []
+  if KEEP_TS and ts:
+    pieces.append(ts)
+  if sender:
+    pieces.append(sender)
+  tag = source
+  if msg_id:
+    tag = f"{source}:id={msg_id}"
+  if tag:
+    pieces.append(tag)
+  pieces.append(text if text is not None else "")
+  print(" | ".join(pieces))
+
+# ---------- Telegram HTML ----------
+class TelegramHTMLParser(HTMLParser):
+  def __init__(self):
+    super().__init__()
+    self.in_msg = False
+    self.msg_depth = 0
+    self.depth = 0
+    self.cur = None
+    self.field = None
+    self.emitted = 0
+
+  def handle_starttag(self, tag, attrs):
+    self.depth += 1
+    attrs = dict(attrs)
+    cls = attrs.get("class", "") or ""
+    if tag == "div" and ((" message" in f" {cls} ") or cls.startswith("message")) and attrs.get("id", "").startswith("message"):
+      self.flush()
+      self.in_msg = True
+      self.msg_depth = self.depth
+      self.cur = {"id": attrs.get("id"), "sender": [], "text": [], "ts": None}
+      self.field = None
+      return
+    if not self.in_msg:
+      return
+    if self.in_msg and tag in {"img", "video", "audio"}:
+      if self.cur is not None:
+        self.cur["text"].append(f"[{tag}]")
+    if self.in_msg and "media_wrap" in cls:
+      if self.cur is not None:
+        self.cur["text"].append("[media]")
+    if tag == "div":
+      if "from_name" in cls:
+        self.field = "sender"
+      elif cls.strip() == "text" or "text " in f"{cls} ":
+        self.field = "text"
+      elif "date" in cls and attrs.get("title"):
+        self.cur["ts"] = attrs.get("title")
+    if tag == "br" and self.field == "text":
+      self.cur["text"].append("\n")
+
+  def handle_endtag(self, tag):
+    if self.in_msg and self.depth == self.msg_depth:
+      self.flush()
+      self.in_msg = False
+      self.field = None
+    self.depth = max(0, self.depth - 1)
+    if self.field and tag == "div":
+      self.field = None
+
+  def handle_data(self, data):
+    if not (self.in_msg and self.field):
+      return
+    if self.field == "sender":
+      self.cur["sender"].append(data)
+    elif self.field == "text":
+      self.cur["text"].append(data)
+
+  def flush(self):
+    if not self.cur:
+      return
+    sender = norm_text("".join(self.cur.get("sender", [])))
+    text = norm_text("".join(self.cur.get("text", [])))
+    msg_id = self.cur.get("id")
+    ts = self.cur.get("ts") or ""
+    if ts and " " in ts and "T" not in ts:
+      ts = ts.replace(" ", "T", 1)
+    emit_line(ts, sender, "telegram_html", text, msg_id=msg_id)
+    self.emitted += 1
+    self.cur = None
+
+def parse_telegram_html(path: str) -> bool:
+  try:
+    raw = open(path, "r", encoding="utf-8", errors="ignore").read()
+  except Exception:
+    return False
+  if 'class="message' not in raw and "class='message" not in raw:
+    return False
+  parser = TelegramHTMLParser()
+  parser.feed(raw)
+  parser.close()
+  return parser.emitted > 0
+
+# ---------- Telegram JSON ----------
+def flatten_telegram_text(text_field):
+  if isinstance(text_field, str):
+    return text_field
+  if isinstance(text_field, list):
+    parts = []
+    for item in text_field:
+      if isinstance(item, str):
+        parts.append(item)
+      elif isinstance(item, dict):
+        val = item.get("text")
+        if val:
+          parts.append(str(val))
+    return "".join(parts)
+  return ""
+
+def parse_telegram_json(path: str) -> bool:
+  try:
+    obj = json.load(open(path, "r", encoding="utf-8"))
+  except Exception:
+    return False
+  msgs = obj.get("messages")
+  if not isinstance(msgs, list):
+    return False
+  emitted = 0
+  for msg in msgs:
+    if not isinstance(msg, dict):
+      continue
+    text = flatten_telegram_text(msg.get("text", ""))
+    if not text:
+      mt = msg.get("media_type") or msg.get("type")
+      if mt:
+        text = f"[{mt}]"
+    sender = msg.get("from", "") or msg.get("actor", "")
+    ts = msg.get("date")
+    emit_line(ts or "", sender or "", "telegram_json", norm_text(text), msg.get("id"))
+    emitted += 1
+  return emitted > 0
+
+# ---------- Messenger JSON ----------
+def ts_from_ms(ms):
+  try:
+    dt = datetime.fromtimestamp(int(ms)/1000, tz=timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+  except Exception:
+    return ""
+
+def parse_messenger_json(path: str) -> bool:
+  try:
+    obj = json.load(open(path, "r", encoding="utf-8"))
+  except Exception:
+    return False
+  msgs = obj.get("messages")
+  if not isinstance(msgs, list):
+    return False
+  emitted = 0
+  for msg in reversed(msgs):
+    if not isinstance(msg, dict):
+      continue
+    sender = msg.get("sender_name", "")
+    text = msg.get("content")
+    attachments = msg.get("photos") or msg.get("videos") or msg.get("files") or []
+    if attachments and not text:
+      labels = []
+      for att in attachments:
+        if isinstance(att, dict) and att.get("uri"):
+          labels.append(f"[{att.get('uri').split('/')[-1]}]")
+      text = " ".join(labels) if labels else "[attachment]"
+    emit_line(ts_from_ms(msg.get("timestamp_ms")), sender or "", "messenger_json", norm_text(text or ""), msg.get("message_id"))
+    emitted += 1
+  return emitted > 0
+
+# ---------- WhatsApp TXT ----------
+WA_RE = re.compile(r"^\[?(\d{1,2}/\d{1,2}/\d{2,4}),\s+([^\]]+?)\]?\s+-\s+([^:]+):\s*(.*)$")
+
+def parse_wa_ts(datestr, timestr):
+  for fmt in ("%m/%d/%y %I:%M %p", "%d/%m/%Y %H:%M", "%m/%d/%Y %I:%M %p", "%d/%m/%y %I:%M %p", "%m/%d/%y %H:%M"):
+    try:
+      dt = datetime.strptime(f"{datestr} {timestr}".strip(), fmt)
+      return dt.isoformat()
+    except Exception:
+      continue
+  return f"{datestr} {timestr}"
+
+def parse_whatsapp_txt(path: str) -> bool:
+  try:
+    lines = open(path, "r", encoding="utf-8", errors="ignore").read().splitlines()
+  except Exception:
+    return False
+  messages = []
+  cur = None
+  for line in lines:
+    m = WA_RE.match(line)
+    if m:
+      if cur:
+        messages.append(cur)
+      cur = {
+        "ts": parse_wa_ts(m.group(1), m.group(2)),
+        "sender": m.group(3).strip(),
+        "text": m.group(4).strip()
+      }
+    else:
+      if cur:
+        cur["text"] += " " + line.strip()
+  if cur:
+    messages.append(cur)
+  if len(messages) < 2:
+    return False
+  for msg in messages:
+    emit_line(msg.get("ts", ""), msg.get("sender", ""), "whatsapp_txt", norm_text(msg.get("text", "")))
+  return True
+
+def main():
+  if len(sys.argv) != 2:
+    print("chat-preproc: expected exactly 1 arg: path", file=sys.stderr)
+    return 2
+  path = sys.argv[1]
+  handlers = (parse_telegram_json, parse_telegram_html, parse_messenger_json, parse_whatsapp_txt)
+  for fn in handlers:
+    try:
+      if fn(path):
+        return 0
+    except Exception:
+      continue
+  # Fallback: pass-through
+  try:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+      for line in f:
+        sys.stdout.write(line)
+    return 0
+  except Exception:
+    return 2
+
+if __name__ == "__main__":
+  raise SystemExit(main())
+PY
+
 # Enumerate all files (always include hidden, so verbose can report hidden-excluded counts)
 : >"$tmp_all"
 for p in "${PATHS[@]}"; do
@@ -647,17 +917,19 @@ import os, sys, json
 all_path = sys.argv[1]
 out_text = sys.argv[2]
 out_rich = sys.argv[3]
-out_xlsx = sys.argv[4]
-out_pptx = sys.argv[5]
-out_doc  = sys.argv[6]
-bad_rich_txt = sys.argv[7]
-stats_json = sys.argv[8]
+out_chat = sys.argv[4]
+out_xlsx = sys.argv[5]
+out_pptx = sys.argv[6]
+out_doc  = sys.argv[7]
+bad_rich_txt = sys.argv[8]
+stats_json = sys.argv[9]
 
-mode = sys.argv[9]
-filter_exts = set([x.strip().lower() for x in sys.argv[10].split(",") if x.strip()])
-have_rga_preproc = (sys.argv[11] == "1")
-min_rich_size = int(sys.argv[12])
-search_hidden = (sys.argv[13] == "1")
+mode = sys.argv[10]
+filter_exts = set([x.strip().lower() for x in sys.argv[11].split(",") if x.strip()])
+have_rga_preproc = (sys.argv[12] == "1")
+min_rich_size = int(sys.argv[13])
+search_hidden = (sys.argv[14] == "1")
+chat_mode = (sys.argv[15] == "1")
 
 RICH_EXTS = {"pdf","docx","sqlite","sqlite3","db","db3"}
 XLSX_EXTS = {"xlsx","xls"}
@@ -665,6 +937,9 @@ PPTX_EXTS = {"pptx","ppt"}
 DOC_EXTS  = {"doc"}
 
 OFFICE_TEMP_EXTS = {"docx","xlsx","pptx","xls","ppt"}
+CHAT_HTML_EXTS = {"html","htm"}
+CHAT_JSON_EXTS = {"json"}
+CHAT_TXT_EXTS = {"txt"}
 
 def is_hidden_path(p: str) -> bool:
   # Same semantics as your audit: any path segment starting with "."
@@ -704,6 +979,73 @@ def write_nul(fh, s: str):
   fh.write(s.encode("utf-8", "surrogateescape"))
   fh.write(b"\0")
 
+SNIFF_LIMIT = 65536
+sniff_cache = {}
+def sniff(path: str) -> bytes:
+  if path in sniff_cache:
+    return sniff_cache[path]
+  data = b""
+  try:
+    with open(path, "rb") as f:
+      data = f.read(SNIFF_LIMIT)
+  except Exception:
+    data = b""
+  sniff_cache[path] = data
+  return data
+
+def looks_like_telegram_html(s: bytes) -> bool:
+  t = s.lower()
+  return (b'class=\"message' in t and b'id=\"message' in t)
+
+def looks_like_telegram_json(obj) -> bool:
+  return isinstance(obj, dict) and isinstance(obj.get("messages"), list)
+
+def looks_like_messenger_json(obj) -> bool:
+  if not (isinstance(obj, dict) and isinstance(obj.get("messages"), list)):
+    return False
+  msgs = obj.get("messages") or []
+  if not msgs:
+    return False
+  first = msgs[0]
+  return isinstance(first, dict) and "timestamp_ms" in first and "sender_name" in first
+
+def looks_like_whatsapp_txt(s: bytes) -> bool:
+  # Look for typical WhatsApp prefix "[1/1/23, 10:00 AM] Name: ..."
+  first = s.splitlines()[:10]
+  for line in first:
+    l = line.decode("utf-8", "ignore")
+    if l.startswith("[") or l[:2].isdigit():
+      if ":" in l and "-" in l:
+        return True
+  return False
+
+def should_route_chat(path: str, ext: str, lazy_sniff) -> bool:
+  p_low = path.lower()
+  base = os.path.basename(p_low)
+
+  if ext in CHAT_HTML_EXTS:
+    return True
+
+  if ext in CHAT_JSON_EXTS:
+    if base.startswith(("message", "messages", "result")) or "messages" in p_low:
+      return True
+    try:
+      import json as _json
+      data = lazy_sniff()
+      obj = _json.loads(data.decode("utf-8", "ignore"))
+      if looks_like_telegram_json(obj) or looks_like_messenger_json(obj):
+        return True
+    except Exception:
+      pass
+    return False
+
+  if ext in CHAT_TXT_EXTS:
+    if "whatsapp" in p_low or "chat" in base:
+      return True
+    if looks_like_whatsapp_txt(lazy_sniff()):
+      return True
+  return False
+
 stats = {}
 def st(ext: str):
   d = stats.get(ext)
@@ -729,7 +1071,7 @@ except Exception:
 paths = [p for p in raw.split(b"\0") if p]
 bad = []
 
-with open(out_text, "wb") as ft, open(out_rich, "wb") as fr, open(out_xlsx, "wb") as fx, open(out_pptx, "wb") as fp, open(out_doc, "wb") as fd:
+with open(out_text, "wb") as ft, open(out_rich, "wb") as fr, open(out_chat, "wb") as fc, open(out_xlsx, "wb") as fx, open(out_pptx, "wb") as fp, open(out_doc, "wb") as fd:
   for pb in paths:
     try:
       p = pb.decode("utf-8", "surrogateescape")
@@ -759,6 +1101,18 @@ with open(out_text, "wb") as ft, open(out_rich, "wb") as fr, open(out_xlsx, "wb"
       sd["skipped_own"] += 1
       sd["skipped_bad_rich"] += 1
       bad.append(f"skip-office-temp(~$): {p}")
+      continue
+
+    sniff_data = None
+    def lazy_sniff():
+      nonlocal sniff_data
+      if sniff_data is None:
+        sniff_data = sniff(p)
+      return sniff_data
+
+    if chat_mode and should_route_chat(p, ext, lazy_sniff):
+      sd["attempted"] += 1
+      write_nul(fc, p)
       continue
 
     if ext in XLSX_EXTS:
@@ -820,10 +1174,10 @@ fi
 MIN_RICH_SIZE=128
 if [[ "$VERBOSE" -eq 1 || "$LOUD" -eq 1 ]]; then
   python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
-    "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" 2>&1 | tee -a "$DEBUG_LOG" >&2
+    "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" "$CHAT_MODE" 2>&1 | tee -a "$DEBUG_LOG" >&2
 else
   python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
-    "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" 2>>"$DEBUG_LOG" >/dev/null || true
+    "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" "$CHAT_MODE" 2>>"$DEBUG_LOG" >/dev/null || true
 fi
 
 # Persist bad-rich list to a stable path
@@ -960,6 +1314,7 @@ if [[ "$LOUD" -eq 0 && "$VERBOSE" -eq 0 ]]; then
   RG_BASE+=(--no-messages)
 fi
 
+RG_CHAT=("${RG_BASE[@]}" --pre "CHAT_KEEP_TS=$CHAT_KEEP_TS python3 $tmp_chat" -- "$PATTERN")
 RG_TEXT=("${RG_BASE[@]}" -- "$PATTERN")
 RG_RICH=("${RG_BASE[@]}" --pre "$RGA_PREPROC" -- "$PATTERN")
 
@@ -977,6 +1332,11 @@ RG_DOC=()
   set +o pipefail
 
   warn_groups=0
+
+  if [[ "$CHAT_MODE" -eq 1 ]]; then
+    run_rg_json_parallel "$tmp_chat_list" "$PAR_TEXT" "$BATCH_TEXT" "$tmp_err_chat" "${RG_CHAT[@]}"; r=$?
+    [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
+  fi
 
   run_rg_json_parallel "$tmp_text" "$PAR_TEXT" "$BATCH_TEXT" "$tmp_err_text" "${RG_TEXT[@]}"; r=$?
   [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
@@ -1074,6 +1434,7 @@ with open(out_fail, "w", encoding="utf-8", errors="replace") as out:
 PY
 
 python3 "$tmp_failparse" "$tmp_err_text" "$FAIL_TEXT_PERSIST" || true
+python3 "$tmp_failparse" "$tmp_err_chat" "$FAIL_CHAT_PERSIST" || true
 python3 "$tmp_failparse" "$tmp_err_rich" "$FAIL_RICH_PERSIST" || true
 python3 "$tmp_failparse" "$tmp_err_xlsx" "$FAIL_XLSX_PERSIST" || true
 python3 "$tmp_failparse" "$tmp_err_pptx" "$FAIL_PPTX_PERSIST" || true
@@ -1086,6 +1447,7 @@ if [[ "$warn_groups" -gt 0 ]]; then
   echo "[g] warnings: ${warn_groups} group(s) reported rc>=2 at least once (extraction/IO errors). Matches (if any) were still reported." >&2
   echo "[g] failed-file logs:" >&2
   echo "  $FAIL_TEXT_PERSIST" >&2
+  echo "  $FAIL_CHAT_PERSIST" >&2
   echo "  $FAIL_RICH_PERSIST" >&2
   echo "  $FAIL_XLSX_PERSIST" >&2
   echo "  $FAIL_PPTX_PERSIST" >&2
@@ -1096,11 +1458,11 @@ fi
 # Verbose end-of-run summary
 # ------------------------------------------------------------
 if [[ "$VERBOSE" -eq 1 ]]; then
-  cat >"$tmp_vsum" <<'PY'
+cat >"$tmp_vsum" <<'PY'
 import json, os, sys
 from collections import defaultdict
 
-stats_path, fail_text, fail_rich, fail_doc, fail_xlsx, fail_pptx = sys.argv[1:7]
+stats_path, fail_text, fail_chat, fail_rich, fail_doc, fail_xlsx, fail_pptx = sys.argv[1:8]
 
 def ext_of(path: str) -> str:
   base = os.path.basename(path)
@@ -1136,6 +1498,7 @@ def ingest_fail(p):
     pass
 
 ingest_fail(fail_text)
+ingest_fail(fail_chat)
 ingest_fail(fail_rich)
 ingest_fail(fail_doc)
 ingest_fail(fail_xlsx)
@@ -1216,7 +1579,7 @@ if len(rows) > TOPN:
 print("---- end per-extension scan summary ----\n")
 PY
 
-  python3 "$tmp_vsum" "$tmp_stats_json" "$FAIL_TEXT_PERSIST" "$FAIL_RICH_PERSIST" "$FAIL_DOC_PERSIST" "$FAIL_XLSX_PERSIST" "$FAIL_PPTX_PERSIST" \
+  python3 "$tmp_vsum" "$tmp_stats_json" "$FAIL_TEXT_PERSIST" "$FAIL_CHAT_PERSIST" "$FAIL_RICH_PERSIST" "$FAIL_DOC_PERSIST" "$FAIL_XLSX_PERSIST" "$FAIL_PPTX_PERSIST" \
     | tee -a "$DEBUG_LOG" >&2
 fi
 
