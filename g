@@ -875,12 +875,35 @@ def parse_whatsapp_txt(path: str) -> bool:
     emit_line(msg.get("ts", ""), msg.get("sender", ""), "whatsapp_txt", norm_text(msg.get("text", "")))
   return True
 
+# ---------- Generic JSON (list of dict messages) ----------
+def parse_generic_json(path: str) -> bool:
+  try:
+    obj = json.load(open(path, "r", encoding="utf-8"))
+  except Exception:
+    return False
+  if not isinstance(obj, list) or not obj:
+    return False
+  emitted = 0
+  for item in obj:
+    if not isinstance(item, dict):
+      continue
+    txt = item.get("message") or item.get("text") or item.get("content")
+    if isinstance(txt, list):
+      txt = " ".join(str(x) for x in txt if x)
+    if txt is None:
+      continue
+    sender = item.get("from") or item.get("sender") or item.get("author") or item.get("name") or ""
+    ts = item.get("sent_date") or item.get("date") or item.get("timestamp") or ""
+    emit_line(str(ts), str(sender), "chat_json", norm_text(str(txt)), item.get("id"))
+    emitted += 1
+  return emitted > 0
+
 def main():
   if len(sys.argv) != 2:
     print("chat-preproc: expected exactly 1 arg: path", file=sys.stderr)
     return 2
   path = sys.argv[1]
-  handlers = (parse_telegram_json, parse_telegram_html, parse_messenger_json, parse_whatsapp_txt)
+  handlers = (parse_telegram_json, parse_telegram_html, parse_messenger_json, parse_whatsapp_txt, parse_generic_json)
   for fn in handlers:
     try:
       if fn(path):
@@ -1022,6 +1045,14 @@ def looks_like_whatsapp_txt(s: bytes) -> bool:
         return True
   return False
 
+def looks_like_generic_chat_json(obj) -> bool:
+  if not isinstance(obj, list):
+    return False
+  for item in obj[:10]:
+    if isinstance(item, dict) and any(k in item for k in ("message","text","content")):
+      return True
+  return False
+
 def should_route_chat(path: str, ext: str, lazy_sniff) -> bool:
   p_low = path.lower()
   base = os.path.basename(p_low)
@@ -1037,7 +1068,7 @@ def should_route_chat(path: str, ext: str, lazy_sniff) -> bool:
       import json as _json
       data = lazy_sniff()
       obj = _json.loads(data.decode("utf-8", "ignore"))
-      if looks_like_telegram_json(obj) or looks_like_messenger_json(obj):
+      if looks_like_telegram_json(obj) or looks_like_messenger_json(obj) or looks_like_generic_chat_json(obj):
         return True
     except Exception:
       pass
