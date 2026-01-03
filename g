@@ -658,7 +658,7 @@ chmod +x "$tmp_doc"
 
 cat >"$tmp_chat" <<'PY'
 #!/usr/bin/env python3
-import os, sys, json, re, html
+import os, sys, json, re, html, sqlite3
 from html.parser import HTMLParser
 from datetime import datetime, timezone
 
@@ -691,6 +691,7 @@ class TelegramHTMLParser(HTMLParser):
     self.cur = None
     self.field = None
     self.emitted = 0
+    self.last_sender = ""
 
   def handle_starttag(self, tag, attrs):
     self.depth += 1
@@ -720,6 +721,10 @@ class TelegramHTMLParser(HTMLParser):
         self.cur["ts"] = attrs.get("title")
     if tag == "br" and self.field == "text":
       self.cur["text"].append("\n")
+    if tag == "a" and self.field == "text":
+      href = attrs.get("href")
+      if href:
+        self.cur["text"].append(f" {href} ")
 
   def handle_endtag(self, tag):
     if self.in_msg and self.depth == self.msg_depth:
@@ -741,7 +746,10 @@ class TelegramHTMLParser(HTMLParser):
   def flush(self):
     if not self.cur:
       return
-    sender = norm_text("".join(self.cur.get("sender", [])))
+    sender_raw = norm_text("".join(self.cur.get("sender", [])))
+    sender = sender_raw or self.last_sender
+    if sender_raw:
+      self.last_sender = sender_raw
     text = norm_text("".join(self.cur.get("text", [])))
     msg_id = self.cur.get("id")
     ts = self.cur.get("ts") or ""
@@ -806,6 +814,13 @@ def parse_telegram_json(path: str) -> bool:
 def ts_from_ms(ms):
   try:
     dt = datetime.fromtimestamp(int(ms)/1000, tz=timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+  except Exception:
+    return ""
+
+def ts_from_sec(sec):
+  try:
+    dt = datetime.fromtimestamp(int(sec), tz=timezone.utc)
     return dt.isoformat().replace("+00:00", "Z")
   except Exception:
     return ""
@@ -898,12 +913,51 @@ def parse_generic_json(path: str) -> bool:
     emitted += 1
   return emitted > 0
 
+# ---------- Telegram SQLite (unofficial backups) ----------
+def parse_telegram_sqlite(path: str) -> bool:
+  try:
+    conn = sqlite3.connect(path)
+  except Exception:
+    return False
+  emitted = 0
+  try:
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = {r[0] for r in cur.fetchall()}
+    if "messages" not in tables:
+      return False
+
+    cur.execute("PRAGMA table_info(messages)")
+    cols = {r[1] for r in cur.fetchall()}
+    needed = {"message_id", "text", "sender_id", "time"}
+    if not needed.issubset(cols):
+      return False
+
+    try:
+      cur.execute("SELECT message_id, sender_id, text, time FROM messages WHERE message_type IS NULL OR message_type='message'")
+    except Exception:
+      cur.execute("SELECT message_id, sender_id, text, time FROM messages")
+
+    for mid, sender, text, ts in cur:
+      if text is None or str(text).strip() == "":
+        continue
+      emit_line(ts_from_sec(ts), str(sender or ""), "telegram_sqlite", norm_text(str(text)), mid)
+      emitted += 1
+  except Exception:
+    return False
+  finally:
+    try:
+      conn.close()
+    except Exception:
+      pass
+  return emitted > 0
+
 def main():
   if len(sys.argv) != 2:
     print("chat-preproc: expected exactly 1 arg: path", file=sys.stderr)
     return 2
   path = sys.argv[1]
-  handlers = (parse_telegram_json, parse_telegram_html, parse_messenger_json, parse_whatsapp_txt, parse_generic_json)
+  handlers = (parse_telegram_json, parse_telegram_html, parse_messenger_json, parse_whatsapp_txt, parse_generic_json, parse_telegram_sqlite)
   for fn in handlers:
     try:
       if fn(path):
@@ -966,6 +1020,7 @@ OFFICE_TEMP_EXTS = {"docx","xlsx","pptx","xls","ppt"}
 CHAT_HTML_EXTS = {"html","htm"}
 CHAT_JSON_EXTS = {"json"}
 CHAT_TXT_EXTS = {"txt"}
+CHAT_SQLITE_EXTS = {"sqlite","db"}
 
 def is_hidden_path(p: str) -> bool:
   # Same semantics as your audit: any path segment starting with "."
@@ -1071,6 +1126,11 @@ def should_route_chat(path: str, ext: str, lazy_sniff) -> bool:
         return True
     except Exception:
       pass
+    return False
+
+  if ext in CHAT_SQLITE_EXTS:
+    if "telegram" in p_low or "database" in base:
+      return True
     return False
 
   if ext in CHAT_TXT_EXTS:
