@@ -70,11 +70,81 @@ EOF
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Error: '$1' not found in PATH." >&2; exit 127; }; }
 
 # ------------------------------------------------------------
-# Pre-scan argv for anywhere flags
+# Dependency bootstrap (Codex Web environments may not preinstall fd/ripgrep)
 # ------------------------------------------------------------
+APT_UPDATED=0
+
+apt_update_once() {
+  if [[ "$APT_UPDATED" -eq 0 ]]; then
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -y
+      APT_UPDATED=1
+    else
+      echo "Warning: apt-get not available; unable to auto-install missing deps." >&2
+      APT_UPDATED=-1
+    fi
+  fi
+}
+
+install_if_missing() {
+  local cmd="$1"
+  local pkg="$2"
+  local alt_cmd="${3:-}"
+
+  if command -v "$cmd" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ -n "$alt_cmd" && -x "$(command -v "$alt_cmd" 2>/dev/null)" ]]; then
+    ln -sf "$(command -v "$alt_cmd")" "/usr/local/bin/$cmd"
+    if command -v "$cmd" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  apt_update_once
+  if [[ "$APT_UPDATED" -ge 0 ]]; then
+    apt-get install -y "$pkg"
+  fi
+
+  if [[ -n "$alt_cmd" && -x "$(command -v "$alt_cmd" 2>/dev/null)" && ! -x "$(command -v "$cmd" 2>/dev/null)" ]]; then
+    ln -sf "$(command -v "$alt_cmd")" "/usr/local/bin/$cmd"
+  fi
+}
+
+# ------------------------------------------------------------
+# Pre-scan argv for anywhere flags (including options that take args)
+# ------------------------------------------------------------
+args=("$@")
 filtered=()
-for arg in "$@"; do
+skip_next=0
+for idx in "${!args[@]}"; do
+  if [[ "$skip_next" -eq 1 ]]; then
+    skip_next=0
+    continue
+  fi
+
+  arg="${args[$idx]}"
   case "$arg" in
+    --)
+      filtered+=("${args[@]:$idx}")
+      break
+      ;;
+    -B|-A|-C)
+      next_idx=$((idx + 1))
+      next_val="${args[$next_idx]:-}"
+      if [[ -z "$next_val" ]]; then
+        echo "Error: option $arg requires an argument" >&2
+        exit 2
+      fi
+      case "$arg" in
+        -B) BEFORE="$next_val" ;;
+        -A) AFTER="$next_val" ;;
+        -C) BEFORE="$next_val"; AFTER="$next_val" ;;
+      esac
+      skip_next=1
+      continue
+      ;;
     --audit) AUDIT=1; continue ;;
     --hidden) SEARCH_HIDDEN=1; continue ;;
     --uuu|-uuu|---uuu) SEARCH_UUU=1; continue ;;
@@ -119,6 +189,10 @@ shift $((OPTIND - 1))
 if [[ "$UCOUNT" -ge 1 ]]; then SEARCH_HIDDEN=1; fi
 if [[ "$UCOUNT" -ge 2 ]]; then NO_IGNORE=1; fi
 if [[ "$UCOUNT" -ge 3 ]]; then SEARCH_BINARY=1; SEARCH_UUU=1; fi
+
+install_if_missing rg ripgrep
+install_if_missing fd fd-find fdfind
+install_if_missing gawk gawk
 
 need_cmd rg
 need_cmd python3
