@@ -8,6 +8,9 @@ AFTER=10
 VERBOSE=0
 LOUD=0
 AUDIT=0
+CHAT_MODE=0
+CHAT_KEEP_TS=1
+CHAT_PREFILTER="${G_CHAT_PREFILTER:-1}"
 
 SEARCH_HIDDEN=0
 SEARCH_UUU=0
@@ -17,6 +20,11 @@ UCOUNT=0
 
 EXT_FILTER_MODE="all"  # all|whitelist|blacklist
 DEBUG_LOG="${DEBUG_LOG:-g.debug.log}"
+
+case "${CHAT_PREFILTER,,}" in
+  0|false|no|off) CHAT_PREFILTER=0 ;;
+  *) CHAT_PREFILTER=1 ;;
+esac
 
 # ------------------------------------------------------------
 # Parallelism defaults (override via env if desired)
@@ -63,6 +71,10 @@ Options:
   -C N           set both -B and -A to N
   -v             verbose (debug log + end-of-run per-extension scan summary)
   --loud         show extractor/preprocessor messages
+  --chat         normalize supported chat exports before searching (in chat mode -B/-A/-C are message counts)
+  --chat-ts=VAL  keep (keep) or drop (drop) timestamps in chat output (default: keep)
+  --chat-prefilter    prefilter chat files with raw rg before parsing (default: on)
+  --no-chat-prefilter disable chat prefilter
   -h, --help     help
 EOF
 }
@@ -152,6 +164,25 @@ for idx in "${!args[@]}"; do
     --no_ignore|--no-ignore) NO_IGNORE=1; continue ;;
     --whitelist) EXT_FILTER_MODE="whitelist"; continue ;;
     --blacklist) EXT_FILTER_MODE="blacklist"; continue ;;
+    --chat) CHAT_MODE=1; continue ;;
+    --chat-prefilter) CHAT_PREFILTER=1; continue ;;
+    --no-chat-prefilter) CHAT_PREFILTER=0; continue ;;
+    --chat-prefilter=*)
+      val="${arg#*=}"
+      case "$val" in
+        1|true|yes|on) CHAT_PREFILTER=1 ;;
+        0|false|no|off) CHAT_PREFILTER=0 ;;
+        *) echo "Error: unknown value for --chat-prefilter (use on|off)" >&2; exit 2 ;;
+      esac
+      continue ;;
+    --chat-ts=*)
+      val="${arg#*=}"
+      case "$val" in
+        keep) CHAT_KEEP_TS=1 ;;
+        drop) CHAT_KEEP_TS=0 ;;
+        *) echo "Error: unknown value for --chat-ts (use keep|drop)" >&2; exit 2 ;;
+      esac
+      continue ;;
   esac
   filtered+=("$arg")
 done
@@ -176,6 +207,25 @@ while getopts ":B:A:C:vhu-:" opt; do
         no_ignore|no-ignore) NO_IGNORE=1 ;;
         whitelist) EXT_FILTER_MODE="whitelist" ;;
         blacklist) EXT_FILTER_MODE="blacklist" ;;
+        chat) CHAT_MODE=1 ;;
+        chat-prefilter) CHAT_PREFILTER=1 ;;
+        no-chat-prefilter) CHAT_PREFILTER=0 ;;
+        chat-prefilter=*)
+          val="${OPTARG#*=}"
+          case "$val" in
+            1|true|yes|on) CHAT_PREFILTER=1 ;;
+            0|false|no|off) CHAT_PREFILTER=0 ;;
+            *) echo "Error: unknown value for --chat-prefilter (use on|off)" >&2; usage; exit 2 ;;
+          esac
+          ;;
+        chat-ts=*)
+          val="${OPTARG#*=}"
+          case "$val" in
+            keep) CHAT_KEEP_TS=1 ;;
+            drop) CHAT_KEEP_TS=0 ;;
+            *) echo "Error: unknown value for --chat-ts (use keep|drop)" >&2; usage; exit 2 ;;
+          esac
+          ;;
         *) echo "Error: unknown option --${OPTARG}" >&2; usage; exit 2 ;;
       esac
       ;;
@@ -189,6 +239,7 @@ shift $((OPTIND - 1))
 if [[ "$UCOUNT" -ge 1 ]]; then SEARCH_HIDDEN=1; fi
 if [[ "$UCOUNT" -ge 2 ]]; then NO_IGNORE=1; fi
 if [[ "$UCOUNT" -ge 3 ]]; then SEARCH_BINARY=1; SEARCH_UUU=1; fi
+export CHAT_KEEP_TS
 
 install_if_missing rg ripgrep
 install_if_missing fd fd-find fdfind
@@ -351,12 +402,17 @@ tmp_split="$(mktemp -t g_split.XXXXXX.py)"
 tmp_xlsx="$(mktemp -t g_xlsx.XXXXXX.py)"
 tmp_pptx="$(mktemp -t g_pptx.XXXXXX.py)"
 tmp_doc="$(mktemp -t g_doc.XXXXXX.sh)"
+tmp_chat="$(mktemp -t g_chat.XXXXXX.py)"
 tmp_vsum="$(mktemp -t g_vsum.XXXXXX.py)"
 tmp_failparse="$(mktemp -t g_failparse.XXXXXX.py)"
 
 tmp_all="$(mktemp -t g_all.XXXXXX.bin)"
 tmp_text="$(mktemp -t g_text.XXXXXX.bin)"
 tmp_rich="$(mktemp -t g_rich.XXXXXX.bin)"
+tmp_chat_list="$(mktemp -t g_chat_list.XXXXXX.bin)"
+tmp_chat_text_list="$(mktemp -t g_chat_text_list.XXXXXX.bin)"
+tmp_chat_bin_list="$(mktemp -t g_chat_bin_list.XXXXXX.bin)"
+tmp_chat_prefilter="$(mktemp -t g_chat_prefilter.XXXXXX.bin)"
 tmp_xlsx_list="$(mktemp -t g_xlsx_list.XXXXXX.bin)"
 tmp_pptx_list="$(mktemp -t g_pptx_list.XXXXXX.bin)"
 tmp_doc_list="$(mktemp -t g_doc_list.XXXXXX.bin)"
@@ -370,6 +426,8 @@ tmp_shards_root="$(mktemp -d -t g_shards_root.XXXXXX)"
 
 tmp_err_text="$(mktemp -t g_err_text.XXXXXX.txt)"
 tmp_err_rich="$(mktemp -t g_err_rich.XXXXXX.txt)"
+tmp_err_chat="$(mktemp -t g_err_chat.XXXXXX.txt)"
+tmp_err_chat_prefilter="$(mktemp -t g_err_chat_prefilter.XXXXXX.txt)"
 tmp_err_xlsx="$(mktemp -t g_err_xlsx.XXXXXX.txt)"
 tmp_err_pptx="$(mktemp -t g_err_pptx.XXXXXX.txt)"
 tmp_err_doc="$(mktemp -t g_err_doc.XXXXXX.txt)"
@@ -377,6 +435,7 @@ tmp_err_doc="$(mktemp -t g_err_doc.XXXXXX.txt)"
 BAD_RICH_PERSIST="${DEBUG_LOG}.bad_rich.txt"
 
 FAIL_TEXT_PERSIST="${DEBUG_LOG}.fail_text.txt"
+FAIL_CHAT_PERSIST="${DEBUG_LOG}.fail_chat.txt"
 FAIL_RICH_PERSIST="${DEBUG_LOG}.fail_rich.txt"
 FAIL_XLSX_PERSIST="${DEBUG_LOG}.fail_xlsx.txt"
 FAIL_PPTX_PERSIST="${DEBUG_LOG}.fail_pptx.txt"
@@ -385,21 +444,24 @@ FAIL_DOC_PERSIST="${DEBUG_LOG}.fail_doc.txt"
 cleanup() {
   [[ "${BASHPID:-$$}" -eq "$MAIN_BASHPID" ]] || return 0
   rm -f "$tmp_fmt" "$tmp_split" "$tmp_xlsx" "$tmp_pptx" "$tmp_doc" "$tmp_vsum" "$tmp_failparse" \
-        "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" \
+        "$tmp_chat" \
+        "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_chat_text_list" "$tmp_chat_bin_list" "$tmp_chat_prefilter" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" \
         "$tmp_bad_rich" "$tmp_stats_json" "$tmp_rc2" "$tmp_mc" \
-        "$tmp_err_text" "$tmp_err_rich" "$tmp_err_xlsx" "$tmp_err_pptx" "$tmp_err_doc"
+        "$tmp_err_text" "$tmp_err_rich" "$tmp_err_chat" "$tmp_err_chat_prefilter" "$tmp_err_xlsx" "$tmp_err_pptx" "$tmp_err_doc"
   rm -rf "$tmp_shards_root"
 }
 trap cleanup EXIT
 
 # Formatter: prints matches and writes match_count
 cat >"$tmp_fmt" <<'PY'
-import json, re, sys
+import json, re, sys, os, subprocess, html
+from html.parser import HTMLParser
 
 before = int(sys.argv[1])
 after  = int(sys.argv[2])
 ctx_lines = int(sys.argv[3])
 match_count_path = sys.argv[4]
+chat_mode = (len(sys.argv) > 5 and sys.argv[5] == "1")
 
 token_re = re.compile(r"\S+")
 RED   = "\x1b[31m"
@@ -407,6 +469,8 @@ GREEN = "\x1b[32m"
 RESET = "\x1b[0m"
 
 match_no = 0
+CHAT_PREFIX = "\x1eCHAT\t"
+preproc_path = sys.argv[6] if len(sys.argv) > 6 else ""
 
 def byte_to_char_index(s: str, byte_idx: int) -> int:
   if byte_idx <= 0:
@@ -421,7 +485,204 @@ def byte_to_char_index(s: str, byte_idx: int) -> int:
 def tokens_with_spans(s: str):
   return [(m.start(), m.end()) for m in token_re.finditer(s)]
 
+def highlight_spans(s: str, spans):
+  if not spans:
+    return s
+  ranges = []
+  for sb, eb in spans:
+    if eb <= 0:
+      continue
+    if sb < 0:
+      sb = 0
+    if eb < sb:
+      sb, eb = eb, sb
+    if sb == eb:
+      continue
+    s_char = byte_to_char_index(s, sb)
+    e_char = byte_to_char_index(s, eb)
+    if e_char < s_char:
+      s_char, e_char = e_char, s_char
+    if s_char == e_char:
+      continue
+    ranges.append((s_char, e_char))
+
+  if not ranges:
+    return s
+  ranges.sort()
+  merged = []
+  for a, b in ranges:
+    if not merged or a > merged[-1][1]:
+      merged.append([a, b])
+    elif b > merged[-1][1]:
+      merged[-1][1] = b
+
+  out = []
+  last = 0
+  for a, b in merged:
+    if a < last:
+      a = last
+    out.append(s[last:a])
+    out.append(f"{RED}{s[a:b]}{RESET}")
+    last = b
+  out.append(s[last:])
+  return "".join(out)
+
 files = {}
+
+def split_chat_line(s: str):
+  if s.startswith(CHAT_PREFIX):
+    payload = s[len(CHAT_PREFIX):]
+    parts = payload.split("\t", 2)
+    if len(parts) == 3:
+      ts, sender, msg = parts
+      prefix = f"{CHAT_PREFIX}{ts}\t{sender}\t"
+      return msg, ts, sender, len(prefix.encode("utf-8")), True
+  return s, "", "", 0, False
+
+next_path_cache = {}
+next_chat_cache = {}
+
+class _StopParse(Exception):
+  pass
+
+def _norm_text(s: str) -> str:
+  return " ".join((s or "").replace("\r", "").replace("\n", " ").split())
+
+class _FacebookHTMLParser(HTMLParser):
+  def __init__(self, limit: int):
+    super().__init__()
+    self.limit = max(0, int(limit))
+    self.depth = 0
+    self.in_header = False
+    self.header_depth = 0
+    self.field = None
+    self.header_user = []
+    self.header_ts = []
+    self.pending_header = None
+    self.in_p = False
+    self.p_text = []
+    self.messages = []
+
+  def handle_starttag(self, tag, attrs):
+    self.depth += 1
+    attrs = dict(attrs)
+    cls = attrs.get("class", "") or ""
+    if tag == "div" and "message_header" in f" {cls} ":
+      self.in_header = True
+      self.header_depth = self.depth
+      self.field = None
+      self.header_user = []
+      self.header_ts = []
+      return
+    if self.in_header and tag == "span":
+      if "user" in f" {cls} ":
+        self.field = "user"
+      elif "meta" in f" {cls} ":
+        self.field = "meta"
+    if self.pending_header and tag == "p" and not self.in_p:
+      self.in_p = True
+      self.p_text = []
+      return
+    if self.in_p:
+      if tag == "br":
+        self.p_text.append("\n")
+      elif tag in {"img", "video", "audio"}:
+        self.p_text.append(f"[{tag}]")
+      elif tag == "a":
+        href = attrs.get("href")
+        if href:
+          self.p_text.append(f" {html.unescape(href)} ")
+
+  def handle_endtag(self, tag):
+    if self.in_header and tag == "div" and self.depth == self.header_depth:
+      sender = _norm_text(html.unescape("".join(self.header_user)))
+      ts = _norm_text(html.unescape("".join(self.header_ts)))
+      if sender or ts:
+        self.pending_header = (ts, sender)
+      else:
+        self.pending_header = None
+      self.in_header = False
+      self.field = None
+    if self.in_p and tag == "p":
+      text = _norm_text(html.unescape("".join(self.p_text)))
+      ts, sender = self.pending_header or ("", "")
+      self.messages.append((text, sender, ts))
+      if self.limit and len(self.messages) >= self.limit:
+        raise _StopParse()
+      self.in_p = False
+      self.p_text = []
+      self.pending_header = None
+    if self.field and tag == "span":
+      self.field = None
+    self.depth = max(0, self.depth - 1)
+
+  def handle_data(self, data):
+    if self.in_header and self.field:
+      if self.field == "user":
+        self.header_user.append(data)
+      elif self.field == "meta":
+        self.header_ts.append(data)
+    elif self.in_p:
+      self.p_text.append(data)
+
+def next_html_path(path: str) -> str:
+  cached = next_path_cache.get(path)
+  if cached is not None:
+    return cached
+  base = os.path.basename(path)
+  m = re.match(r"^(.*?)(\d+)(\.[^.]+)$", base)
+  if not m:
+    next_path_cache[path] = ""
+    return ""
+  prefix, num, ext = m.group(1), m.group(2), m.group(3)
+  if ext.lower() not in (".html", ".htm"):
+    next_path_cache[path] = ""
+    return ""
+  try:
+    next_num = str(int(num) + 1).zfill(len(num))
+  except Exception:
+    next_path_cache[path] = ""
+    return ""
+  next_base = f"{prefix}{next_num}{ext}"
+  next_path = os.path.join(os.path.dirname(path), next_base)
+  if not os.path.isfile(next_path):
+    next_path_cache[path] = ""
+    return ""
+  next_path_cache[path] = next_path
+  return next_path
+
+def read_next_chat_lines(path: str, want: int):
+  if want <= 0 or not preproc_path:
+    return []
+  next_path = next_html_path(path)
+  if not next_path:
+    return []
+  cached = next_chat_cache.get(next_path)
+  if cached is None:
+    lines = []
+    try:
+      proc = subprocess.run([sys.executable, preproc_path, next_path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False)
+      for line in proc.stdout.splitlines():
+        msg, ts, sender, _, is_chat = split_chat_line(line)
+        if is_chat:
+          lines.append((msg, sender, ts))
+    except Exception:
+      lines = []
+    if not lines and next_path.lower().endswith((".html", ".htm")):
+      try:
+        parser = _FacebookHTMLParser(want)
+        with open(next_path, "r", encoding="utf-8", errors="ignore") as f:
+          try:
+            parser.feed(f.read())
+            parser.close()
+          except _StopParse:
+            pass
+        lines = parser.messages
+      except Exception:
+        lines = []
+    next_chat_cache[next_path] = lines
+    cached = lines
+  return cached[:want]
 
 def get_path(obj):
   d = obj.get("data", {})
@@ -443,11 +704,11 @@ for raw in sys.stdin:
     continue
 
   if typ == "begin":
-    files[path] = {"lines": {}, "matches": []}
+    files[path] = {"lines": {}, "matches": [], "ts": {}, "senders": {}, "prefix_b": {}, "chat_lines": set()}
     continue
 
   if path not in files:
-    files[path] = {"lines": {}, "matches": []}
+    files[path] = {"lines": {}, "matches": [], "ts": {}, "senders": {}, "prefix_b": {}, "chat_lines": set()}
 
   data = obj.get("data", {})
 
@@ -455,7 +716,17 @@ for raw in sys.stdin:
     line_no = data.get("line_number")
     text = data.get("lines", {}).get("text", "")
     if line_no is not None:
-      files[path]["lines"][int(line_no)] = text.rstrip("\n")
+      raw_text = text.rstrip("\n").replace("\r", "")
+      clean_text, ts, sender, prefix_b, is_chat = split_chat_line(raw_text)
+      ln = int(line_no)
+      files[path]["lines"][ln] = clean_text
+      files[path]["prefix_b"][ln] = prefix_b if is_chat else 0
+      if is_chat:
+        files[path]["chat_lines"].add(ln)
+      if is_chat and ts:
+        files[path]["ts"][ln] = ts
+      if is_chat and sender:
+        files[path]["senders"][ln] = sender
 
     if typ == "match":
       for sub in data.get("submatches", []):
@@ -473,11 +744,60 @@ for raw in sys.stdin:
 
     lines_map = buf["lines"]
     matches = buf["matches"]
+    ts_map = buf.get("ts", {})
+    sender_map = buf.get("senders", {})
+    prefix_map = buf.get("prefix_b", {})
+    chat_lines = buf.get("chat_lines", set())
     all_line_nos = sorted(lines_map.keys())
+
+    chat_spans = {}
+    if chat_mode and matches:
+      for m in matches:
+        ln = m.get("line_no")
+        if ln is None or ln not in chat_lines:
+          continue
+        prefix_b = prefix_map.get(ln, 0)
+        start_b = m.get("start_b", 0) - prefix_b
+        end_b = m.get("end_b", 0) - prefix_b
+        if end_b <= 0:
+          continue
+        if start_b < 0:
+          start_b = 0
+        if start_b == end_b:
+          continue
+        chat_spans.setdefault(ln, []).append((start_b, end_b))
 
     for m in matches:
       ln = m["line_no"]
       if ln is None:
+        continue
+
+      line_text = lines_map.get(ln, "")
+      prefix_b = prefix_map.get(ln, 0)
+      if prefix_b and m["start_b"] < prefix_b:
+        continue
+      mtxt = m.get("mtxt", "")
+      if chat_mode and ln in chat_lines:
+        start_ln = ln - before
+        end_ln = ln + after
+        match_no += 1
+        print(f"{GREEN}{match_no}{RESET} {path}:{ln}:")
+        for n in all_line_nos:
+          if n < start_ln or n > end_ln:
+            continue
+          msg = lines_map.get(n, "")
+          spans = chat_spans.get(n)
+          if spans:
+            msg = highlight_spans(msg, spans)
+          sender = sender_map.get(n, "")
+          ts = ts_map.get(n, "")
+          print(f"{{{msg},{sender},{ts}}}")
+        max_ln = max(all_line_nos) if all_line_nos else 0
+        missing_after = max(0, end_ln - max_ln)
+        if missing_after:
+          for msg, sender, ts in read_next_chat_lines(path, missing_after):
+            print(f"{{{msg},{sender},{ts}}}")
+        print("")
         continue
 
       local_nos = [n for n in all_line_nos if abs(n - ln) <= ctx_lines]
@@ -494,9 +814,14 @@ for raw in sys.stdin:
         pos += len(t) + 1
       combined = " ".join(parts)
 
-      line_text = lines_map.get(ln, "")
-      s_char = byte_to_char_index(line_text, m["start_b"])
-      e_char = byte_to_char_index(line_text, m["end_b"])
+      adj_start = m["start_b"] - prefix_b
+      adj_end = m["end_b"] - prefix_b
+      if adj_end < 0:
+        continue
+      if adj_start < 0:
+        adj_start = 0
+      s_char = byte_to_char_index(line_text, adj_start)
+      e_char = byte_to_char_index(line_text, adj_end)
       if e_char < s_char:
         s_char, e_char = e_char, s_char
 
@@ -525,12 +850,13 @@ for raw in sys.stdin:
 
       snippet = " ".join(combined[a:b] for (a, b) in toks[lo:hi])
 
-      mtxt = m.get("mtxt", "")
       if mtxt:
         snippet = snippet.replace(mtxt, f"{RED}{mtxt}{RESET}", 1)
 
+      ts = ts_map.get(ln, "")
+      ts_prefix = f"{ts} | " if ts else ""
       match_no += 1
-      print(f"{GREEN}{match_no}{RESET} {path}:{ln}: {snippet}\n")
+      print(f"{GREEN}{match_no}{RESET} {path}:{ln}: {ts_prefix}{snippet}\n")
 
     files.pop(path, None)
 
@@ -628,6 +954,463 @@ exit 2
 SH
 chmod +x "$tmp_doc"
 
+cat >"$tmp_chat" <<'PY'
+#!/usr/bin/env python3
+import os, sys, json, re, html, sqlite3
+from html.parser import HTMLParser
+from datetime import datetime, timezone
+
+KEEP_TS = os.environ.get("CHAT_KEEP_TS", "1").lower() not in {"0", "false", "no", "off"}
+CHAT_PREFIX = "\x1eCHAT\t"
+
+def norm_text(s: str) -> str:
+  return " ".join((s or "").replace("\r", "").replace("\n", " ").split())
+
+def emit_chat_line(ts: str, sender: str, text: str):
+  if not KEEP_TS:
+    ts = ""
+  ts = norm_text(ts) if ts else ""
+  sender = norm_text(sender) if sender else ""
+  out_text = norm_text(text) if text is not None else ""
+  print(f"{CHAT_PREFIX}{ts}\t{sender}\t{out_text}")
+
+# ---------- Telegram HTML ----------
+class TelegramHTMLParser(HTMLParser):
+  def __init__(self):
+    super().__init__()
+    self.in_msg = False
+    self.msg_depth = 0
+    self.depth = 0
+    self.cur = None
+    self.field = None
+    self.emitted = 0
+    self.last_sender = ""
+
+  def handle_starttag(self, tag, attrs):
+    self.depth += 1
+    attrs = dict(attrs)
+    cls = attrs.get("class", "") or ""
+    if tag == "div" and ((" message" in f" {cls} ") or cls.startswith("message")) and attrs.get("id", "").startswith("message"):
+      self.flush()
+      self.in_msg = True
+      self.msg_depth = self.depth
+      self.cur = {"id": attrs.get("id"), "sender": [], "text": [], "ts": None}
+      self.field = None
+      return
+    if not self.in_msg:
+      return
+    if self.in_msg and tag in {"img", "video", "audio"}:
+      if self.cur is not None:
+        self.cur["text"].append(f"[{tag}]")
+    if self.in_msg and "media_wrap" in cls:
+      if self.cur is not None:
+        self.cur["text"].append("[media]")
+    if tag == "div":
+      if "from_name" in cls:
+        self.field = "sender"
+      elif cls.strip() == "text" or "text " in f"{cls} ":
+        self.field = "text"
+      elif "date" in cls and attrs.get("title"):
+        self.cur["ts"] = attrs.get("title")
+    if tag == "br" and self.field == "text":
+      self.cur["text"].append("\n")
+    if tag == "a" and self.field == "text":
+      href = attrs.get("href")
+      if href:
+        self.cur["text"].append(f" {href} ")
+
+  def handle_endtag(self, tag):
+    if self.in_msg and self.depth == self.msg_depth:
+      self.flush()
+      self.in_msg = False
+      self.field = None
+    self.depth = max(0, self.depth - 1)
+    if self.field and tag == "div":
+      self.field = None
+
+  def handle_data(self, data):
+    if not (self.in_msg and self.field):
+      return
+    if self.field == "sender":
+      self.cur["sender"].append(data)
+    elif self.field == "text":
+      self.cur["text"].append(data)
+
+  def flush(self):
+    if not self.cur:
+      return
+    sender_raw = norm_text("".join(self.cur.get("sender", [])))
+    sender = sender_raw or self.last_sender
+    if sender_raw:
+      self.last_sender = sender_raw
+    text = norm_text("".join(self.cur.get("text", [])))
+    msg_id = self.cur.get("id")
+    ts = self.cur.get("ts") or ""
+    if ts and " " in ts and "T" not in ts:
+      ts = ts.replace(" ", "T", 1)
+    emit_chat_line(ts, sender, text)
+    self.emitted += 1
+    self.cur = None
+
+def parse_telegram_html(path: str) -> bool:
+  try:
+    raw = open(path, "r", encoding="utf-8", errors="ignore").read()
+  except Exception:
+    return False
+  if 'class="message' not in raw and "class='message" not in raw:
+    return False
+  parser = TelegramHTMLParser()
+  parser.feed(raw)
+  parser.close()
+  return parser.emitted > 0
+
+# ---------- Facebook Messenger HTML (legacy exports) ----------
+class FacebookHTMLParser(HTMLParser):
+  def __init__(self):
+    super().__init__()
+    self.depth = 0
+    self.in_header = False
+    self.header_depth = 0
+    self.field = None
+    self.header_user = []
+    self.header_ts = []
+    self.pending_header = None
+    self.in_p = False
+    self.p_text = []
+    self.emitted = 0
+
+  def handle_starttag(self, tag, attrs):
+    self.depth += 1
+    attrs = dict(attrs)
+    cls = attrs.get("class", "") or ""
+    if tag == "div" and "message_header" in f" {cls} ":
+      self.in_header = True
+      self.header_depth = self.depth
+      self.field = None
+      self.header_user = []
+      self.header_ts = []
+      return
+    if self.in_header and tag == "span":
+      if "user" in f" {cls} ":
+        self.field = "user"
+      elif "meta" in f" {cls} ":
+        self.field = "meta"
+    if self.pending_header and tag == "p" and not self.in_p:
+      self.in_p = True
+      self.p_text = []
+      return
+    if self.in_p:
+      if tag == "br":
+        self.p_text.append("\n")
+      elif tag in {"img", "video", "audio"}:
+        self.p_text.append(f"[{tag}]")
+      elif tag == "a":
+        href = attrs.get("href")
+        if href:
+          self.p_text.append(f" {html.unescape(href)} ")
+
+  def handle_endtag(self, tag):
+    if self.in_header and tag == "div" and self.depth == self.header_depth:
+      sender = norm_text("".join(self.header_user))
+      ts = norm_text("".join(self.header_ts))
+      if sender or ts:
+        self.pending_header = (ts, sender)
+      else:
+        self.pending_header = None
+      self.in_header = False
+      self.field = None
+    if self.in_p and tag == "p":
+      text = norm_text("".join(self.p_text))
+      ts, sender = self.pending_header or ("", "")
+      emit_chat_line(ts, sender, text)
+      self.emitted += 1
+      self.in_p = False
+      self.p_text = []
+      self.pending_header = None
+    if self.field and tag == "span":
+      self.field = None
+    self.depth = max(0, self.depth - 1)
+
+  def handle_data(self, data):
+    if self.in_header and self.field:
+      if self.field == "user":
+        self.header_user.append(data)
+      elif self.field == "meta":
+        self.header_ts.append(data)
+    elif self.in_p:
+      self.p_text.append(data)
+
+def parse_facebook_html(path: str) -> bool:
+  try:
+    raw = open(path, "r", encoding="utf-8", errors="ignore").read()
+  except Exception:
+    return False
+  if 'class="message_header"' not in raw and "class='message_header'" not in raw:
+    return False
+  parser = FacebookHTMLParser()
+  parser.feed(raw)
+  parser.close()
+  return parser.emitted > 0
+
+# ---------- Telegram JSON ----------
+def flatten_telegram_text(text_field):
+  if isinstance(text_field, str):
+    return text_field
+  if isinstance(text_field, list):
+    parts = []
+    for item in text_field:
+      if isinstance(item, str):
+        parts.append(item)
+      elif isinstance(item, dict):
+        val = item.get("text")
+        if val:
+          parts.append(str(val))
+    return "".join(parts)
+  return ""
+
+def emit_telegram_messages(msgs):
+  emitted = 0
+  for msg in msgs:
+    if not isinstance(msg, dict):
+      continue
+    text = flatten_telegram_text(msg.get("text", ""))
+    if not text:
+      mt = msg.get("media_type") or msg.get("type")
+      if mt:
+        text = f"[{mt}]"
+    sender = msg.get("from", "") or msg.get("actor", "")
+    ts = msg.get("date")
+    emit_chat_line(ts or "", sender or "", norm_text(text))
+    emitted += 1
+  return emitted
+
+def parse_telegram_json(path: str) -> bool:
+  try:
+    obj = json.load(open(path, "r", encoding="utf-8"))
+  except Exception:
+    return False
+  msgs = obj.get("messages")
+  if not isinstance(msgs, list):
+    return False
+  return emit_telegram_messages(msgs) > 0
+
+# ---------- Messenger JSON ----------
+def ts_from_ms(ms):
+  try:
+    dt = datetime.fromtimestamp(int(ms)/1000, tz=timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+  except Exception:
+    return ""
+
+def ts_from_sec(sec):
+  try:
+    dt = datetime.fromtimestamp(int(sec), tz=timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+  except Exception:
+    return ""
+
+def emit_messenger_messages(msgs):
+  emitted = 0
+  for msg in reversed(msgs):
+    if not isinstance(msg, dict):
+      continue
+    sender = msg.get("sender_name", "")
+    text = msg.get("content")
+    attachments = msg.get("photos") or msg.get("videos") or msg.get("files") or []
+    if attachments and not text:
+      labels = []
+      for att in attachments:
+        if isinstance(att, dict) and att.get("uri"):
+          labels.append(f"[{att.get('uri').split('/')[-1]}]")
+      text = " ".join(labels) if labels else "[attachment]"
+    emit_chat_line(ts_from_ms(msg.get("timestamp_ms")), sender or "", norm_text(text or ""))
+    emitted += 1
+  return emitted
+
+def parse_messenger_json(path: str) -> bool:
+  try:
+    obj = json.load(open(path, "r", encoding="utf-8"))
+  except Exception:
+    return False
+  msgs = obj.get("messages")
+  if not isinstance(msgs, list):
+    return False
+  return emit_messenger_messages(msgs) > 0
+
+# ---------- WhatsApp TXT ----------
+WA_RE = re.compile(r"^\[?(\d{1,2}/\d{1,2}/\d{2,4}),\s+([^\]]+?)\]?\s+-\s+([^:]+):\s*(.*)$")
+
+def parse_wa_ts(datestr, timestr):
+  for fmt in ("%m/%d/%y %I:%M %p", "%d/%m/%Y %H:%M", "%m/%d/%Y %I:%M %p", "%d/%m/%y %I:%M %p", "%m/%d/%y %H:%M"):
+    try:
+      dt = datetime.strptime(f"{datestr} {timestr}".strip(), fmt)
+      return dt.isoformat()
+    except Exception:
+      continue
+  return f"{datestr} {timestr}"
+
+def parse_whatsapp_txt(path: str) -> bool:
+  try:
+    lines = open(path, "r", encoding="utf-8", errors="ignore").read().splitlines()
+  except Exception:
+    return False
+  messages = []
+  cur = None
+  for line in lines:
+    m = WA_RE.match(line)
+    if m:
+      if cur:
+        messages.append(cur)
+      cur = {
+        "ts": parse_wa_ts(m.group(1), m.group(2)),
+        "sender": m.group(3).strip(),
+        "text": m.group(4).strip()
+      }
+    else:
+      if cur:
+        cur["text"] += " " + line.strip()
+  if cur:
+    messages.append(cur)
+  if len(messages) < 2:
+    return False
+  for msg in messages:
+    emit_chat_line(msg.get("ts", ""), msg.get("sender", ""), norm_text(msg.get("text", "")))
+  return True
+
+# ---------- Generic JSON (list of dict messages) ----------
+def emit_generic_messages(items):
+  emitted = 0
+  for item in items:
+    if not isinstance(item, dict):
+      continue
+    txt = item.get("message") or item.get("text") or item.get("content")
+    if isinstance(txt, list):
+      txt = " ".join(str(x) for x in txt if x)
+    if txt is None:
+      continue
+    sender = item.get("from") or item.get("sender") or item.get("author") or item.get("name") or ""
+    ts = item.get("sent_date") or item.get("date") or item.get("timestamp") or ""
+    emit_chat_line(str(ts), str(sender), norm_text(str(txt)))
+    emitted += 1
+  return emitted
+
+def parse_generic_json(path: str) -> bool:
+  try:
+    obj = json.load(open(path, "r", encoding="utf-8"))
+  except Exception:
+    return False
+  if not isinstance(obj, list) or not obj:
+    return False
+  return emit_generic_messages(obj) > 0
+
+def looks_like_messenger_messages(msgs) -> bool:
+  for msg in msgs[:20]:
+    if isinstance(msg, dict) and ("sender_name" in msg or "timestamp_ms" in msg):
+      return True
+  return False
+
+def looks_like_telegram_messages(msgs) -> bool:
+  for msg in msgs[:20]:
+    if isinstance(msg, dict) and any(k in msg for k in ("from", "actor", "date", "text", "media_type")):
+      return True
+  return False
+
+def parse_json_any(path: str) -> bool:
+  try:
+    obj = json.load(open(path, "r", encoding="utf-8"))
+  except Exception:
+    return False
+
+  if isinstance(obj, dict) and isinstance(obj.get("messages"), list):
+    msgs = obj.get("messages") or []
+    if looks_like_messenger_messages(msgs):
+      return emit_messenger_messages(msgs) > 0
+    if looks_like_telegram_messages(msgs):
+      return emit_telegram_messages(msgs) > 0
+    return emit_generic_messages(msgs) > 0
+
+  if isinstance(obj, list):
+    return emit_generic_messages(obj) > 0
+
+  return False
+
+# ---------- Telegram SQLite (unofficial backups) ----------
+def parse_telegram_sqlite(path: str) -> bool:
+  try:
+    conn = sqlite3.connect(path)
+  except Exception:
+    return False
+  emitted = 0
+  try:
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = {r[0] for r in cur.fetchall()}
+    if "messages" not in tables:
+      return False
+
+    cur.execute("PRAGMA table_info(messages)")
+    cols = {r[1] for r in cur.fetchall()}
+    needed = {"message_id", "text", "sender_id", "time"}
+    if not needed.issubset(cols):
+      return False
+
+    try:
+      cur.execute("SELECT message_id, sender_id, text, time FROM messages WHERE message_type IS NULL OR message_type='message'")
+    except Exception:
+      cur.execute("SELECT message_id, sender_id, text, time FROM messages")
+
+    for mid, sender, text, ts in cur:
+      if text is None or str(text).strip() == "":
+        continue
+      emit_chat_line(ts_from_sec(ts), str(sender), norm_text(str(text)))
+      emitted += 1
+  except Exception:
+    return False
+  finally:
+    try:
+      conn.close()
+    except Exception:
+      pass
+  return emitted > 0
+
+def handlers_for_path(path: str):
+  ext = os.path.splitext(path)[1].lower()
+  if ext in (".html", ".htm"):
+    return (parse_telegram_html, parse_facebook_html)
+  if ext in (".json",):
+    return (parse_json_any,)
+  if ext in (".txt",):
+    return (parse_whatsapp_txt, parse_json_any)
+  if ext in (".sqlite", ".sqlite3", ".db"):
+    return (parse_telegram_sqlite,)
+  return (parse_json_any, parse_telegram_html, parse_whatsapp_txt, parse_telegram_sqlite)
+
+def main():
+  if len(sys.argv) != 2:
+    print("chat-preproc: expected exactly 1 arg: path", file=sys.stderr)
+    return 2
+  path = sys.argv[1]
+  handlers = handlers_for_path(path)
+  for fn in handlers:
+    try:
+      if fn(path):
+        return 0
+    except Exception:
+      continue
+  # Fallback: pass-through
+  try:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+      for line in f:
+        sys.stdout.write(line)
+    return 0
+  except Exception:
+    return 2
+
+if __name__ == "__main__":
+  raise SystemExit(main())
+PY
+chmod +x "$tmp_chat"
+
 # Enumerate all files (always include hidden, so verbose can report hidden-excluded counts)
 : >"$tmp_all"
 for p in "${PATHS[@]}"; do
@@ -647,17 +1430,19 @@ import os, sys, json
 all_path = sys.argv[1]
 out_text = sys.argv[2]
 out_rich = sys.argv[3]
-out_xlsx = sys.argv[4]
-out_pptx = sys.argv[5]
-out_doc  = sys.argv[6]
-bad_rich_txt = sys.argv[7]
-stats_json = sys.argv[8]
+out_chat = sys.argv[4]
+out_xlsx = sys.argv[5]
+out_pptx = sys.argv[6]
+out_doc  = sys.argv[7]
+bad_rich_txt = sys.argv[8]
+stats_json = sys.argv[9]
 
-mode = sys.argv[9]
-filter_exts = set([x.strip().lower() for x in sys.argv[10].split(",") if x.strip()])
-have_rga_preproc = (sys.argv[11] == "1")
-min_rich_size = int(sys.argv[12])
-search_hidden = (sys.argv[13] == "1")
+mode = sys.argv[10]
+filter_exts = set([x.strip().lower() for x in sys.argv[11].split(",") if x.strip()])
+have_rga_preproc = (sys.argv[12] == "1")
+min_rich_size = int(sys.argv[13])
+search_hidden = (sys.argv[14] == "1")
+chat_mode = (sys.argv[15] == "1")
 
 RICH_EXTS = {"pdf","docx","sqlite","sqlite3","db","db3"}
 XLSX_EXTS = {"xlsx","xls"}
@@ -665,6 +1450,10 @@ PPTX_EXTS = {"pptx","ppt"}
 DOC_EXTS  = {"doc"}
 
 OFFICE_TEMP_EXTS = {"docx","xlsx","pptx","xls","ppt"}
+CHAT_HTML_EXTS = {"html","htm"}
+CHAT_JSON_EXTS = {"json"}
+CHAT_TXT_EXTS = {"txt"}
+CHAT_SQLITE_EXTS = {"sqlite","sqlite3","db"}
 
 def is_hidden_path(p: str) -> bool:
   # Same semantics as your audit: any path segment starting with "."
@@ -704,6 +1493,89 @@ def write_nul(fh, s: str):
   fh.write(s.encode("utf-8", "surrogateescape"))
   fh.write(b"\0")
 
+SNIFF_LIMIT = 65536
+sniff_cache = {}
+def sniff(path: str) -> bytes:
+  if path in sniff_cache:
+    return sniff_cache[path]
+  data = b""
+  try:
+    with open(path, "rb") as f:
+      data = f.read(SNIFF_LIMIT)
+  except Exception:
+    data = b""
+  sniff_cache[path] = data
+  return data
+
+def looks_like_telegram_html(s: bytes) -> bool:
+  t = s.lower()
+  return (b'class=\"message' in t and b'id=\"message' in t)
+
+def looks_like_telegram_json(obj) -> bool:
+  return isinstance(obj, dict) and isinstance(obj.get("messages"), list)
+
+def looks_like_messenger_json(obj) -> bool:
+  if not (isinstance(obj, dict) and isinstance(obj.get("messages"), list)):
+    return False
+  msgs = obj.get("messages") or []
+  if not msgs:
+    return False
+  first = msgs[0]
+  return isinstance(first, dict) and "timestamp_ms" in first and "sender_name" in first
+
+def looks_like_whatsapp_txt(s: bytes) -> bool:
+  # Look for typical WhatsApp prefix "[1/1/23, 10:00 AM] Name: ..."
+  first = s.splitlines()[:10]
+  for line in first:
+    l = line.decode("utf-8", "ignore")
+    if l.startswith("[") or l[:2].isdigit():
+      if ":" in l and "-" in l:
+        return True
+  return False
+
+def looks_like_generic_chat_json(obj) -> bool:
+  if not isinstance(obj, list):
+    return False
+  for item in obj[:10]:
+    if isinstance(item, dict) and any(k in item for k in ("message","text","content")):
+      return True
+  return False
+
+def should_route_chat(path: str, ext: str, lazy_sniff) -> bool:
+  p_low = path.lower()
+  base = os.path.basename(p_low)
+
+  if ext in CHAT_HTML_EXTS:
+    return True
+
+  if ext in CHAT_JSON_EXTS:
+    if base.startswith(("message", "messages", "result")) or "messages" in p_low:
+      return True
+    try:
+      import json as _json
+      data = lazy_sniff()
+      t = data.lower()
+      if b'"messages"' not in t and b'"message"' not in t and b'"text"' not in t and b'"content"' not in t:
+        return False
+      obj = _json.loads(data.decode("utf-8", "ignore"))
+      if looks_like_telegram_json(obj) or looks_like_messenger_json(obj) or looks_like_generic_chat_json(obj):
+        return True
+    except Exception:
+      pass
+    return False
+
+  if ext in CHAT_SQLITE_EXTS:
+    if "telegram" in p_low or "database" in base:
+      return True
+    return False
+
+  if ext in CHAT_TXT_EXTS:
+    if "whatsapp" in p_low or "chat" in base:
+      return True
+    if looks_like_whatsapp_txt(lazy_sniff()):
+      return True
+  return False
+
 stats = {}
 def st(ext: str):
   d = stats.get(ext)
@@ -729,7 +1601,7 @@ except Exception:
 paths = [p for p in raw.split(b"\0") if p]
 bad = []
 
-with open(out_text, "wb") as ft, open(out_rich, "wb") as fr, open(out_xlsx, "wb") as fx, open(out_pptx, "wb") as fp, open(out_doc, "wb") as fd:
+with open(out_text, "wb") as ft, open(out_rich, "wb") as fr, open(out_chat, "wb") as fc, open(out_xlsx, "wb") as fx, open(out_pptx, "wb") as fp, open(out_doc, "wb") as fd:
   for pb in paths:
     try:
       p = pb.decode("utf-8", "surrogateescape")
@@ -759,6 +1631,17 @@ with open(out_text, "wb") as ft, open(out_rich, "wb") as fr, open(out_xlsx, "wb"
       sd["skipped_own"] += 1
       sd["skipped_bad_rich"] += 1
       bad.append(f"skip-office-temp(~$): {p}")
+      continue
+
+    sniff_data = [None]
+    def lazy_sniff():
+      if sniff_data[0] is None:
+        sniff_data[0] = sniff(p)
+      return sniff_data[0]
+
+    if chat_mode and should_route_chat(p, ext, lazy_sniff):
+      sd["attempted"] += 1
+      write_nul(fc, p)
       continue
 
     if ext in XLSX_EXTS:
@@ -819,11 +1702,11 @@ fi
 
 MIN_RICH_SIZE=128
 if [[ "$VERBOSE" -eq 1 || "$LOUD" -eq 1 ]]; then
-  python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
-    "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" 2>&1 | tee -a "$DEBUG_LOG" >&2
+  python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
+    "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" "$CHAT_MODE" 2>&1 | tee -a "$DEBUG_LOG" >&2
 else
-  python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
-    "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" 2>>"$DEBUG_LOG" >/dev/null || true
+  python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
+    "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" "$CHAT_MODE" 2>>"$DEBUG_LOG" >/dev/null || true
 fi
 
 # Persist bad-rich list to a stable path
@@ -953,6 +1836,78 @@ run_rg_json_parallel() {
   return 0
 }
 
+# Optional chat prefilter: skip parsing chat files without raw matches
+if [[ "$CHAT_MODE" -eq 1 && "$CHAT_PREFILTER" -eq 1 && -s "$tmp_chat_list" ]]; then
+  python3 - "$tmp_chat_list" "$tmp_chat_text_list" "$tmp_chat_bin_list" <<'PY'
+import os, sys
+
+in_path, out_text, out_bin = sys.argv[1:4]
+BIN_EXTS = {b".sqlite", b".sqlite3", b".db"}
+
+try:
+  data = open(in_path, "rb").read()
+except Exception:
+  data = b""
+
+paths = [p for p in data.split(b"\0") if p]
+text_paths = []
+bin_paths = []
+for p in paths:
+  base = os.path.basename(p)
+  ext = os.path.splitext(base)[1].lower()
+  if ext in BIN_EXTS:
+    bin_paths.append(p)
+  else:
+    text_paths.append(p)
+
+def write_list(path, items):
+  with open(path, "wb") as f:
+    for p in items:
+      f.write(p)
+      f.write(b"\0")
+
+write_list(out_text, text_paths)
+write_list(out_bin, bin_paths)
+PY
+
+  prefilter_failed=0
+  : >"$tmp_chat_prefilter"
+
+  if [[ -s "$tmp_chat_text_list" ]]; then
+    RG_CHAT_PREFILTER=(rg "${RG_COMMON[@]}" --files-with-matches --null -- "$PATTERN")
+    if [[ "$LOUD" -eq 0 && "$VERBOSE" -eq 0 ]]; then
+      RG_CHAT_PREFILTER+=(--no-messages)
+    fi
+    if ! run_rg_json_parallel "$tmp_chat_text_list" "$PAR_TEXT" "$BATCH_TEXT" "$tmp_err_chat_prefilter" "${RG_CHAT_PREFILTER[@]}" >"$tmp_chat_prefilter"; then
+      prefilter_failed=1
+    fi
+  fi
+
+  if [[ "$prefilter_failed" -eq 0 ]]; then
+    python3 - "$tmp_chat_prefilter" "$tmp_chat_bin_list" "$tmp_chat_list" <<'PY'
+import sys
+
+prefilter_path, bin_path, out_path = sys.argv[1:4]
+
+def read_paths(path):
+  try:
+    data = open(path, "rb").read()
+  except Exception:
+    return []
+  return [p for p in data.split(b"\0") if p]
+
+paths = read_paths(prefilter_path) + read_paths(bin_path)
+
+with open(out_path, "wb") as f:
+  for p in paths:
+    f.write(p)
+    f.write(b"\0")
+PY
+  elif [[ "$VERBOSE" -eq 1 ]]; then
+    echo "chat prefilter: failed; using full chat list" >>"$DEBUG_LOG"
+  fi
+fi
+
 start_ns="$(date +%s%N)"
 
 RG_BASE=(rg "${RG_COMMON[@]}" --json --no-heading -C "$CTX_LINES" --context-separator "")
@@ -960,6 +1915,7 @@ if [[ "$LOUD" -eq 0 && "$VERBOSE" -eq 0 ]]; then
   RG_BASE+=(--no-messages)
 fi
 
+RG_CHAT=("${RG_BASE[@]}" --pre "$tmp_chat" -- "$PATTERN")
 RG_TEXT=("${RG_BASE[@]}" -- "$PATTERN")
 RG_RICH=("${RG_BASE[@]}" --pre "$RGA_PREPROC" -- "$PATTERN")
 
@@ -977,6 +1933,11 @@ RG_DOC=()
   set +o pipefail
 
   warn_groups=0
+
+  if [[ "$CHAT_MODE" -eq 1 ]]; then
+    run_rg_json_parallel "$tmp_chat_list" "$PAR_TEXT" "$BATCH_TEXT" "$tmp_err_chat" "${RG_CHAT[@]}"; r=$?
+    [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
+  fi
 
   run_rg_json_parallel "$tmp_text" "$PAR_TEXT" "$BATCH_TEXT" "$tmp_err_text" "${RG_TEXT[@]}"; r=$?
   [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
@@ -1003,7 +1964,7 @@ RG_DOC=()
 
   echo "$warn_groups" >"$tmp_rc2"
   exit 0
-) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc"
+) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$CHAT_MODE" "$tmp_chat"
 
 end_ns="$(date +%s%N)"
 
@@ -1074,6 +2035,7 @@ with open(out_fail, "w", encoding="utf-8", errors="replace") as out:
 PY
 
 python3 "$tmp_failparse" "$tmp_err_text" "$FAIL_TEXT_PERSIST" || true
+python3 "$tmp_failparse" "$tmp_err_chat" "$FAIL_CHAT_PERSIST" || true
 python3 "$tmp_failparse" "$tmp_err_rich" "$FAIL_RICH_PERSIST" || true
 python3 "$tmp_failparse" "$tmp_err_xlsx" "$FAIL_XLSX_PERSIST" || true
 python3 "$tmp_failparse" "$tmp_err_pptx" "$FAIL_PPTX_PERSIST" || true
@@ -1086,6 +2048,7 @@ if [[ "$warn_groups" -gt 0 ]]; then
   echo "[g] warnings: ${warn_groups} group(s) reported rc>=2 at least once (extraction/IO errors). Matches (if any) were still reported." >&2
   echo "[g] failed-file logs:" >&2
   echo "  $FAIL_TEXT_PERSIST" >&2
+  echo "  $FAIL_CHAT_PERSIST" >&2
   echo "  $FAIL_RICH_PERSIST" >&2
   echo "  $FAIL_XLSX_PERSIST" >&2
   echo "  $FAIL_PPTX_PERSIST" >&2
@@ -1096,11 +2059,11 @@ fi
 # Verbose end-of-run summary
 # ------------------------------------------------------------
 if [[ "$VERBOSE" -eq 1 ]]; then
-  cat >"$tmp_vsum" <<'PY'
+cat >"$tmp_vsum" <<'PY'
 import json, os, sys
 from collections import defaultdict
 
-stats_path, fail_text, fail_rich, fail_doc, fail_xlsx, fail_pptx = sys.argv[1:7]
+stats_path, fail_text, fail_chat, fail_rich, fail_doc, fail_xlsx, fail_pptx = sys.argv[1:8]
 
 def ext_of(path: str) -> str:
   base = os.path.basename(path)
@@ -1136,6 +2099,7 @@ def ingest_fail(p):
     pass
 
 ingest_fail(fail_text)
+ingest_fail(fail_chat)
 ingest_fail(fail_rich)
 ingest_fail(fail_doc)
 ingest_fail(fail_xlsx)
@@ -1216,7 +2180,7 @@ if len(rows) > TOPN:
 print("---- end per-extension scan summary ----\n")
 PY
 
-  python3 "$tmp_vsum" "$tmp_stats_json" "$FAIL_TEXT_PERSIST" "$FAIL_RICH_PERSIST" "$FAIL_DOC_PERSIST" "$FAIL_XLSX_PERSIST" "$FAIL_PPTX_PERSIST" \
+  python3 "$tmp_vsum" "$tmp_stats_json" "$FAIL_TEXT_PERSIST" "$FAIL_CHAT_PERSIST" "$FAIL_RICH_PERSIST" "$FAIL_DOC_PERSIST" "$FAIL_XLSX_PERSIST" "$FAIL_PPTX_PERSIST" \
     | tee -a "$DEBUG_LOG" >&2
 fi
 
