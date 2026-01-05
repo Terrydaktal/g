@@ -295,7 +295,7 @@ command -v antiword >/dev/null 2>&1 && HAVE_DOC=1
 command -v catdoc   >/dev/null 2>&1 && HAVE_DOC=1
 
 FILTER_EXTS=(
-  txt md rst log csv tsv json yaml yml toml ini conf cfg xml html htm css
+  txt md rst log csv tsv json jsonl yaml yml toml ini conf cfg xml html htm css
   py sh bash zsh fish c h cpp hpp cc cxx java kt go rs js mjs cjs ts tsx jsx php rb pl
   pdf docx doc xlsx xls pptx ppt sqlite sqlite3 db db3
 )
@@ -446,6 +446,8 @@ tmp_all="$(mktemp -t g_all.XXXXXX.bin)"
 tmp_text="$(mktemp -t g_text.XXXXXX.bin)"
 tmp_rich="$(mktemp -t g_rich.XXXXXX.bin)"
 tmp_chat_list="$(mktemp -t g_chat_list.XXXXXX.bin)"
+tmp_aichat_list="$(mktemp -t g_aichat_list.XXXXXX.bin)"
+tmp_chat_all="$(mktemp -t g_chat_all.XXXXXX.bin)"
 tmp_chat_text_list="$(mktemp -t g_chat_text_list.XXXXXX.bin)"
 tmp_chat_bin_list="$(mktemp -t g_chat_bin_list.XXXXXX.bin)"
 tmp_chat_prefilter="$(mktemp -t g_chat_prefilter.XXXXXX.bin)"
@@ -478,7 +480,7 @@ cleanup() {
   [[ "${BASHPID:-$$}" -eq "$MAIN_BASHPID" ]] || return 0
   rm -f "$tmp_fmt" "$tmp_split" "$tmp_xlsx" "$tmp_pptx" "$tmp_doc" "$tmp_vsum" "$tmp_failparse" \
         "$tmp_chat" \
-        "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_chat_text_list" "$tmp_chat_bin_list" "$tmp_chat_prefilter" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" \
+        "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_aichat_list" "$tmp_chat_all" "$tmp_chat_text_list" "$tmp_chat_bin_list" "$tmp_chat_prefilter" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" \
         "$tmp_bad_rich" "$tmp_stats_json" "$tmp_rc2" "$tmp_mc" "$tmp_skip_rg" \
         "$tmp_err_text" "$tmp_err_rich" "$tmp_err_chat" "$tmp_err_chat_prefilter" "$tmp_err_xlsx" "$tmp_err_pptx" "$tmp_err_doc" "$tmp_fail_out"
   rm -rf "$tmp_shards_root"
@@ -1419,6 +1421,75 @@ def parse_generic_json(path: str) -> bool:
     return False
   return emit_generic_messages(obj) > 0
 
+def _codex_text_from_content(content):
+  parts = []
+  if isinstance(content, list):
+    for item in content:
+      if isinstance(item, dict):
+        txt = item.get("text")
+        if txt:
+          parts.append(str(txt))
+      elif isinstance(item, str):
+        parts.append(item)
+  elif isinstance(content, dict):
+    txt = content.get("text")
+    if txt:
+      parts.append(str(txt))
+  elif isinstance(content, str):
+    parts.append(content)
+  return " ".join(parts)
+
+def parse_codex_jsonl(path: str) -> bool:
+  try:
+    f = open(path, "r", encoding="utf-8", errors="ignore")
+  except Exception:
+    return False
+
+  resp_msgs = []
+  event_msgs = []
+  saw_codex = False
+  line_no = 0
+  with f:
+    for raw in f:
+      line_no += 1
+      line = raw.strip()
+      if not line or not line.startswith("{"):
+        continue
+      try:
+        obj = json.loads(line)
+      except Exception:
+        continue
+      if not isinstance(obj, dict):
+        continue
+      ts = obj.get("timestamp", "") or ""
+      typ = obj.get("type")
+      if typ in ("response_item", "event_msg", "turn_context", "session_meta"):
+        saw_codex = True
+      payload = obj.get("payload", {})
+      if typ == "response_item" and isinstance(payload, dict) and payload.get("type") == "message":
+        text = _codex_text_from_content(payload.get("content"))
+        if not text:
+          text = payload.get("text") or ""
+        if text:
+          role = payload.get("role") or ""
+          resp_msgs.append((text, role, ts, line_no))
+        continue
+      if typ == "event_msg" and isinstance(payload, dict):
+        et = payload.get("type")
+        if et in ("user_message", "agent_message"):
+          text = payload.get("message") or ""
+          if text:
+            role = "user" if et == "user_message" else "assistant"
+            event_msgs.append((str(text), role, ts, line_no))
+
+  msgs = resp_msgs if resp_msgs else event_msgs
+  if not msgs:
+    return saw_codex
+  for text, sender, ts, ln in msgs:
+    msg = f"L{ln}: {text}"
+    emit_chat_line(ts, sender, msg)
+  return True
+
 def looks_like_messenger_messages(msgs) -> bool:
   for msg in msgs[:20]:
     if isinstance(msg, dict) and ("sender_name" in msg or "timestamp_ms" in msg):
@@ -1493,6 +1564,8 @@ def handlers_for_path(path: str):
   ext = os.path.splitext(path)[1].lower()
   if ext in (".html", ".htm"):
     return (parse_telegram_html, parse_facebook_html)
+  if ext in (".jsonl",):
+    return (parse_codex_jsonl,)
   if ext in (".json",):
     return (parse_json_any,)
   if ext in (".txt",):
@@ -1547,19 +1620,20 @@ all_path = sys.argv[1]
 out_text = sys.argv[2]
 out_rich = sys.argv[3]
 out_chat = sys.argv[4]
-out_xlsx = sys.argv[5]
-out_pptx = sys.argv[6]
-out_doc  = sys.argv[7]
-bad_rich_txt = sys.argv[8]
-stats_json = sys.argv[9]
+out_aichat = sys.argv[5]
+out_xlsx = sys.argv[6]
+out_pptx = sys.argv[7]
+out_doc  = sys.argv[8]
+bad_rich_txt = sys.argv[9]
+stats_json = sys.argv[10]
 
-mode = sys.argv[10]
-filter_exts = set([x.strip().lower() for x in sys.argv[11].split(",") if x.strip()])
-have_rga_preproc = (sys.argv[12] == "1")
-min_rich_size = int(sys.argv[13])
-search_hidden = (sys.argv[14] == "1")
-chat_mode = (sys.argv[15] == "1")
-no_chat_mode = (sys.argv[16] == "1")
+mode = sys.argv[11]
+filter_exts = set([x.strip().lower() for x in sys.argv[12].split(",") if x.strip()])
+have_rga_preproc = (sys.argv[13] == "1")
+min_rich_size = int(sys.argv[14])
+search_hidden = (sys.argv[15] == "1")
+chat_mode = (sys.argv[16] == "1")
+no_chat_mode = (sys.argv[17] == "1")
 
 RICH_EXTS = {"pdf","docx","sqlite","sqlite3","db","db3"}
 XLSX_EXTS = {"xlsx","xls"}
@@ -1569,6 +1643,7 @@ DOC_EXTS  = {"doc"}
 OFFICE_TEMP_EXTS = {"docx","xlsx","pptx","xls","ppt"}
 CHAT_HTML_EXTS = {"html","htm"}
 CHAT_JSON_EXTS = {"json"}
+CHAT_JSONL_EXTS = {"jsonl"}
 CHAT_TXT_EXTS = {"txt"}
 CHAT_SQLITE_EXTS = {"sqlite","sqlite3","db"}
 
@@ -1677,16 +1752,32 @@ def looks_like_generic_chat_json(obj) -> bool:
       return True
   return False
 
-def should_route_chat(path: str, ext: str, lazy_sniff) -> bool:
+def looks_like_codex_jsonl(s: bytes, p_low: str) -> bool:
+  if b'"type":"response_item"' in s or b'"type":"event_msg"' in s:
+    if b'"payload"' in s and b'"timestamp"' in s:
+      return True
+  if b'"type":"session_meta"' in s and b'"payload"' in s and b'"timestamp"' in s:
+    return True
+  if "/.codex/sessions/" in p_low and b'"payload"' in s and b'"timestamp"' in s:
+    return True
+  return False
+
+def should_route_chat(path: str, ext: str, lazy_sniff):
   p_low = path.lower()
   base = os.path.basename(p_low)
 
+  if ext in CHAT_JSONL_EXTS:
+    t = lazy_sniff().lower()
+    if looks_like_codex_jsonl(t, p_low):
+      return "aichat"
+    return False
+
   if ext in CHAT_HTML_EXTS:
     if "telegram" in p_low or "facebook" in p_low or "messenger" in p_low:
-      return True
+      return "chat"
     t = lazy_sniff().lower()
     if b"message" in t:
-      return True
+      return "chat"
     return False
 
   if ext in CHAT_JSON_EXTS:
@@ -1701,26 +1792,26 @@ def should_route_chat(path: str, ext: str, lazy_sniff) -> bool:
           return False
       obj = _json.loads(data.decode("utf-8", "ignore"))
       if looks_like_telegram_json(obj) or looks_like_messenger_json(obj) or looks_like_generic_chat_json(obj):
-        return True
+        return "chat"
     except Exception:
       pass
     return False
 
   if ext in CHAT_SQLITE_EXTS:
     if "telegram" in p_low or "database" in base or "messenger" in p_low or "whatsapp" in p_low:
-      return True
+      return "chat"
     t = lazy_sniff().lower()
     if b"messages" in t and (b"sender" in t or b"text" in t or b"time" in t):
-      return True
+      return "chat"
     return False
 
   if ext in CHAT_TXT_EXTS:
     if "whatsapp" in p_low or "chat" in base or "messages" in p_low:
-      return True
+      return "chat"
     if looks_like_whatsapp_txt(lazy_sniff()):
-      return True
+      return "chat"
     if looks_like_telegram_txt(lazy_sniff()):
-      return True
+      return "chat"
   return False
 
 stats = {}
@@ -1749,7 +1840,7 @@ except Exception:
 paths = [p for p in raw.split(b"\0") if p]
 bad = []
 
-with open(out_text, "wb") as ft, open(out_rich, "wb") as fr, open(out_chat, "wb") as fc, open(out_xlsx, "wb") as fx, open(out_pptx, "wb") as fp, open(out_doc, "wb") as fd:
+with open(out_text, "wb") as ft, open(out_rich, "wb") as fr, open(out_chat, "wb") as fc, open(out_aichat, "wb") as fa, open(out_xlsx, "wb") as fx, open(out_pptx, "wb") as fp, open(out_doc, "wb") as fd:
   for pb in paths:
     try:
       p = pb.decode("utf-8", "surrogateescape")
@@ -1781,11 +1872,14 @@ with open(out_text, "wb") as ft, open(out_rich, "wb") as fr, open(out_chat, "wb"
           sniff_data[0] = sniff(p)
         return sniff_data[0]
 
-      is_chat = should_route_chat(p, ext, lazy_sniff)
-      if is_chat:
+      route = should_route_chat(p, ext, lazy_sniff)
+      if route:
         if chat_mode:
           sd["attempted"] += 1
-          write_nul(fc, p)
+          if route == "aichat":
+            write_nul(fa, p)
+          else:
+            write_nul(fc, p)
         else:
           sd["excluded"] += 1
         continue
@@ -1858,12 +1952,16 @@ fi
 
 MIN_RICH_SIZE=128
 if [[ "$VERBOSE" -eq 1 ]]; then
-  python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
+  python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_aichat_list" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
     "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" "$CHAT_MODE" "$NOCHAT" 1>&2
 else
-  python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
+  python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_aichat_list" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
     "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" "$CHAT_MODE" "$NOCHAT" 2>/dev/null >/dev/null || true
 fi
+
+: >"$tmp_chat_all"
+[[ -s "$tmp_chat_list" ]] && cat "$tmp_chat_list" >>"$tmp_chat_all"
+[[ -s "$tmp_aichat_list" ]] && cat "$tmp_aichat_list" >>"$tmp_chat_all"
 
 # Skip list persisted after rg run (heuristics + rg skips)
 
@@ -1990,8 +2088,8 @@ run_rg_json_parallel() {
 }
 
 # Optional chat prefilter: skip parsing chat files without raw matches
-if [[ "$CHAT_MODE" -eq 1 && "$CHAT_PREFILTER" -eq 1 && -s "$tmp_chat_list" ]]; then
-  python3 - "$tmp_chat_list" "$tmp_chat_text_list" "$tmp_chat_bin_list" <<'PY'
+if [[ "$CHAT_MODE" -eq 1 && "$CHAT_PREFILTER" -eq 1 && -s "$tmp_chat_all" ]]; then
+  python3 - "$tmp_chat_all" "$tmp_chat_text_list" "$tmp_chat_bin_list" <<'PY'
 import os, sys
 
 in_path, out_text, out_bin = sys.argv[1:4]
@@ -2037,7 +2135,7 @@ PY
   fi
 
   if [[ "$prefilter_failed" -eq 0 ]]; then
-    python3 - "$tmp_chat_prefilter" "$tmp_chat_bin_list" "$tmp_chat_list" <<'PY'
+    python3 - "$tmp_chat_prefilter" "$tmp_chat_bin_list" "$tmp_chat_all" <<'PY'
 import sys
 
 prefilter_path, bin_path, out_path = sys.argv[1:4]
@@ -2088,7 +2186,7 @@ RG_DOC=()
   warn_groups=0
 
   if [[ "$CHAT_MODE" -eq 1 ]]; then
-    run_rg_json_parallel "$tmp_chat_list" "$PAR_TEXT" "$BATCH_TEXT" "$tmp_err_chat" "${RG_CHAT[@]}"; r=$?
+    run_rg_json_parallel "$tmp_chat_all" "$PAR_TEXT" "$BATCH_TEXT" "$tmp_err_chat" "${RG_CHAT[@]}"; r=$?
     [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
   else
     run_rg_json_parallel "$tmp_text" "$PAR_TEXT" "$BATCH_TEXT" "$tmp_err_text" "${RG_TEXT[@]}"; r=$?
