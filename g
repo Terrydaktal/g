@@ -6,20 +6,23 @@ MAIN_BASHPID="${BASHPID:-$$}"
 BEFORE=10
 AFTER=10
 VERBOSE=0
-LOUD=0
 AUDIT=0
 CHAT_MODE=0
 CHAT_KEEP_TS=1
 CHAT_PREFILTER="${G_CHAT_PREFILTER:-1}"
+NOCHAT=0
 
 SEARCH_HIDDEN=0
 SEARCH_UUU=0
 SEARCH_BINARY=0
 NO_IGNORE=0
 UCOUNT=0
+CASE_SENSITIVE=0
 
 EXT_FILTER_MODE="all"  # all|whitelist|blacklist
-DEBUG_LOG="${DEBUG_LOG:-g.debug.log}"
+FAIL_LOG="${G_FAIL_LOG:-g.fail.log}"
+SKIP_LOG="${G_SKIP_LOG:-g.skipped.log}"
+MATCH_FILES_LOG="${G_MATCH_FILES_LOG:-g.match_files.log}"
 
 case "${CHAT_PREFILTER,,}" in
   0|false|no|off) CHAT_PREFILTER=0 ;;
@@ -48,7 +51,7 @@ usage() {
   cat <<'EOF'
 Usage:
   g --audit [PATH...]
-  g [--hidden] [--uuu] [-u|-uu|-uuu] [--no_ignore] [--binary] [--whitelist|--blacklist] [-B N] [-A N] [-C N] [-v] [--loud] PATTERN [PATH...]
+  g [--hidden] [--uuu] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
 
 Modes:
   --audit        Fast audit: counts hidden vs non-hidden by extension (fd + gawk only)
@@ -59,19 +62,25 @@ Search flags:
   -u             include hidden
   -uu            include hidden + no ignore (maps to --no_ignore)
   -uuu           include hidden + no-ignore + binary/text + --uuu
-  --uuu          pass rg -uuu
+  --uuu          same as -uuu (include hidden + no-ignore + binary/text + --uuu)
   --no_ignore    do not respect ignore files (rg --no-ignore, fd --no-ignore)
   --binary       treat binary files as text (rg --text)
+  --case-sensitive    force case sensitive search (default: case-insensitive)
+  --nochat       exclude files classified as chat from normal search
   --whitelist    only scan extensions in the hardcoded list
   --blacklist    scan everything EXCEPT extensions in the hardcoded list
+
+Pattern:
+  PATTERN is a regex (ripgrep); quote backslashes in your shell.
+  \x expands to a word token (\b\w+\b).
+  Example: '\bayman\b' matches the word ayman.
 
 Options:
   -B N           words before match (default 10)
   -A N           words after match  (default 10)
   -C N           set both -B and -A to N
-  -v             verbose (debug log + end-of-run per-extension scan summary)
-  --loud         show extractor/preprocessor messages
-  --chat         normalize supported chat exports before searching (in chat mode -B/-A/-C are message counts)
+  -v             verbose (end-of-run per-extension scan summary)
+  --chat         search chat exports only (in chat mode -B/-A/-C are message counts)
   --chat-ts=VAL  keep (keep) or drop (drop) timestamps in chat output (default: keep)
   --chat-prefilter    prefilter chat files with raw rg before parsing (default: on)
   --no-chat-prefilter disable chat prefilter
@@ -159,12 +168,21 @@ for idx in "${!args[@]}"; do
       ;;
     --audit) AUDIT=1; continue ;;
     --hidden) SEARCH_HIDDEN=1; continue ;;
-    --uuu|-uuu|---uuu) SEARCH_UUU=1; continue ;;
+    --uuu|-uuu|---uuu)
+      SEARCH_UUU=1
+      SEARCH_HIDDEN=1
+      NO_IGNORE=1
+      SEARCH_BINARY=1
+      [[ "$UCOUNT" -lt 3 ]] && UCOUNT=3
+      continue
+      ;;
     --binary|--text) SEARCH_BINARY=1; continue ;;
     --no_ignore|--no-ignore) NO_IGNORE=1; continue ;;
+    --nochat) NOCHAT=1; continue ;;
     --whitelist) EXT_FILTER_MODE="whitelist"; continue ;;
     --blacklist) EXT_FILTER_MODE="blacklist"; continue ;;
     --chat) CHAT_MODE=1; continue ;;
+    --case-sensitive) CASE_SENSITIVE=1; continue ;;
     --chat-prefilter) CHAT_PREFILTER=1; continue ;;
     --no-chat-prefilter) CHAT_PREFILTER=0; continue ;;
     --chat-prefilter=*)
@@ -199,15 +217,22 @@ while getopts ":B:A:C:vhu-:" opt; do
     -)
       case "${OPTARG}" in
         help) usage; exit 0 ;;
-        loud) LOUD=1 ;;
         audit) AUDIT=1 ;;
         hidden) SEARCH_HIDDEN=1 ;;
-        uuu) SEARCH_UUU=1 ;;
+        uuu)
+          SEARCH_UUU=1
+          SEARCH_HIDDEN=1
+          NO_IGNORE=1
+          SEARCH_BINARY=1
+          [[ "$UCOUNT" -lt 3 ]] && UCOUNT=3
+          ;;
         binary|text) SEARCH_BINARY=1 ;;
         no_ignore|no-ignore) NO_IGNORE=1 ;;
+        nochat) NOCHAT=1 ;;
         whitelist) EXT_FILTER_MODE="whitelist" ;;
         blacklist) EXT_FILTER_MODE="blacklist" ;;
         chat) CHAT_MODE=1 ;;
+        case-sensitive) CASE_SENSITIVE=1 ;;
         chat-prefilter) CHAT_PREFILTER=1 ;;
         no-chat-prefilter) CHAT_PREFILTER=0 ;;
         chat-prefilter=*)
@@ -388,10 +413,21 @@ fi
 # -----------------------------
 [[ $# -ge 1 ]] || { usage; exit 2; }
 PATTERN="$1"; shift
+PATTERN="$(python3 - "$PATTERN" <<'PY'
+import re, sys
+
+pat = sys.argv[1]
+pat = re.sub(r'(?<!\\)\\x(?![0-9A-Fa-f{])', r'\\b\\w+\\b', pat)
+print(pat)
+PY
+)"
 PATHS=("$@")
 [[ ${#PATHS[@]} -gt 0 ]] || PATHS=(".")
 
-RG_COMMON=()
+RG_COMMON=(--no-fixed-strings)
+if [[ "$CASE_SENSITIVE" -eq 0 ]]; then
+  RG_COMMON+=(--ignore-case)
+fi
 [[ "$SEARCH_HIDDEN" -eq 1 ]] && RG_COMMON+=(--hidden)
 [[ "$NO_IGNORE" -eq 1 ]] && RG_COMMON+=(--no-ignore)
 [[ "$SEARCH_UUU" -eq 1 ]] && RG_COMMON+=(-uuu)
@@ -431,23 +467,20 @@ tmp_err_chat_prefilter="$(mktemp -t g_err_chat_prefilter.XXXXXX.txt)"
 tmp_err_xlsx="$(mktemp -t g_err_xlsx.XXXXXX.txt)"
 tmp_err_pptx="$(mktemp -t g_err_pptx.XXXXXX.txt)"
 tmp_err_doc="$(mktemp -t g_err_doc.XXXXXX.txt)"
+tmp_skip_rg="$(mktemp -t g_skip_rg.XXXXXX.txt)"
+tmp_fail_out="$(mktemp -t g_fail_out.XXXXXX.txt)"
 
-BAD_RICH_PERSIST="${DEBUG_LOG}.bad_rich.txt"
-
-FAIL_TEXT_PERSIST="${DEBUG_LOG}.fail_text.txt"
-FAIL_CHAT_PERSIST="${DEBUG_LOG}.fail_chat.txt"
-FAIL_RICH_PERSIST="${DEBUG_LOG}.fail_rich.txt"
-FAIL_XLSX_PERSIST="${DEBUG_LOG}.fail_xlsx.txt"
-FAIL_PPTX_PERSIST="${DEBUG_LOG}.fail_pptx.txt"
-FAIL_DOC_PERSIST="${DEBUG_LOG}.fail_doc.txt"
+FAIL_PERSIST="$FAIL_LOG"
+SKIP_PERSIST="$SKIP_LOG"
+MATCH_FILES_PERSIST="$MATCH_FILES_LOG"
 
 cleanup() {
   [[ "${BASHPID:-$$}" -eq "$MAIN_BASHPID" ]] || return 0
   rm -f "$tmp_fmt" "$tmp_split" "$tmp_xlsx" "$tmp_pptx" "$tmp_doc" "$tmp_vsum" "$tmp_failparse" \
         "$tmp_chat" \
         "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_chat_text_list" "$tmp_chat_bin_list" "$tmp_chat_prefilter" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" \
-        "$tmp_bad_rich" "$tmp_stats_json" "$tmp_rc2" "$tmp_mc" \
-        "$tmp_err_text" "$tmp_err_rich" "$tmp_err_chat" "$tmp_err_chat_prefilter" "$tmp_err_xlsx" "$tmp_err_pptx" "$tmp_err_doc"
+        "$tmp_bad_rich" "$tmp_stats_json" "$tmp_rc2" "$tmp_mc" "$tmp_skip_rg" \
+        "$tmp_err_text" "$tmp_err_rich" "$tmp_err_chat" "$tmp_err_chat_prefilter" "$tmp_err_xlsx" "$tmp_err_pptx" "$tmp_err_doc" "$tmp_fail_out"
   rm -rf "$tmp_shards_root"
 }
 trap cleanup EXIT
@@ -461,7 +494,8 @@ before = int(sys.argv[1])
 after  = int(sys.argv[2])
 ctx_lines = int(sys.argv[3])
 match_count_path = sys.argv[4]
-chat_mode = (len(sys.argv) > 5 and sys.argv[5] == "1")
+match_files_path = sys.argv[5] if len(sys.argv) > 5 else ""
+chat_mode = (len(sys.argv) > 6 and sys.argv[6] == "1")
 
 token_re = re.compile(r"\S+")
 RED   = "\x1b[31m"
@@ -469,8 +503,11 @@ GREEN = "\x1b[32m"
 RESET = "\x1b[0m"
 
 match_no = 0
+match_files = {}
 CHAT_PREFIX = "\x1eCHAT\t"
-preproc_path = sys.argv[6] if len(sys.argv) > 6 else ""
+preproc_path = sys.argv[7] if len(sys.argv) > 7 else ""
+skip_rg_path = sys.argv[8] if len(sys.argv) > 8 else ""
+skipped_rg = set()
 
 def byte_to_char_index(s: str, byte_idx: int) -> int:
   if byte_idx <= 0:
@@ -703,6 +740,10 @@ for raw in sys.stdin:
   if not path:
     continue
 
+  if typ == "binary":
+    skipped_rg.add(path)
+    continue
+
   if typ == "begin":
     files[path] = {"lines": {}, "matches": [], "ts": {}, "senders": {}, "prefix_b": {}, "chat_lines": set()}
     continue
@@ -833,20 +874,26 @@ for raw in sys.stdin:
       if not toks:
         continue
 
-      idx = None
+      first_idx = None
+      last_idx = None
       for i, (a, b) in enumerate(toks):
-        if b > m_start and a < m_end:
-          idx = i
+        if b <= m_start:
+          continue
+        if a >= m_end:
+          if first_idx is None:
+            first_idx = i
+            last_idx = i
           break
-      if idx is None:
-        idx = 0
-        for i, (a, _) in enumerate(toks):
-          if a >= m_start:
-            idx = i
-            break
+        if first_idx is None:
+          first_idx = i
+        last_idx = i
 
-      lo = max(0, idx - before)
-      hi = min(len(toks), idx + after + 1)
+      if first_idx is None:
+        first_idx = 0
+        last_idx = 0
+
+      lo = max(0, first_idx - before)
+      hi = min(len(toks), last_idx + after + 1)
 
       snippet = " ".join(combined[a:b] for (a, b) in toks[lo:hi])
 
@@ -858,7 +905,27 @@ for raw in sys.stdin:
       match_no += 1
       print(f"{GREEN}{match_no}{RESET} {path}:{ln}: {ts_prefix}{snippet}\n")
 
+    if matches:
+      match_files[path] = len(matches)
     files.pop(path, None)
+
+if skip_rg_path:
+  try:
+    with open(skip_rg_path, "w", encoding="utf-8", errors="replace") as f:
+      for p in sorted(skipped_rg):
+        f.write(f"skip-rg(binary): {p}\n")
+  except Exception:
+    pass
+
+if match_files_path:
+  try:
+    items = [(cnt, path) for path, cnt in match_files.items() if cnt > 0]
+    items.sort(key=lambda x: (-x[0], x[1]))
+    with open(match_files_path, "w", encoding="utf-8", errors="replace") as f:
+      for cnt, path in items:
+        f.write(f"{cnt}\t{path}\n")
+  except Exception:
+    pass
 
 try:
   with open(match_count_path, "w", encoding="utf-8") as f:
@@ -1237,6 +1304,55 @@ def parse_messenger_json(path: str) -> bool:
     return False
   return emit_messenger_messages(msgs) > 0
 
+# ---------- Telegram TXT ----------
+TG_RE = re.compile(r"^\s*[.\-]*\s*(\d{1,2}\.\d{1,2}\.\d{2,4})\s+(\d{1,2}:\d{2}:\d{2}),\s+([^:]+):\s*(.*)$")
+
+def parse_tg_ts(datestr, timestr):
+  for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%y %H:%M:%S"):
+    try:
+      dt = datetime.strptime(f"{datestr} {timestr}".strip(), fmt)
+      return dt.isoformat()
+    except Exception:
+      continue
+  return f"{datestr} {timestr}"
+
+def parse_telegram_txt(path: str) -> bool:
+  try:
+    lines = open(path, "r", encoding="utf-8", errors="ignore").read().splitlines()
+  except Exception:
+    return False
+  messages = []
+  cur = None
+  saw_header = False
+  for raw in lines:
+    line = raw.strip("\r")
+    if not line:
+      continue
+    if line and ord(line[0]) == 0xfeff:
+      line = line[1:]
+    if line.startswith("Your Telegram History"):
+      saw_header = True
+      continue
+    m = TG_RE.match(line)
+    if m:
+      if cur:
+        messages.append(cur)
+      cur = {
+        "ts": parse_tg_ts(m.group(1), m.group(2)),
+        "sender": m.group(3).strip(),
+        "text": m.group(4).strip(),
+      }
+    else:
+      if cur:
+        cur["text"] += " " + line.strip()
+  if cur:
+    messages.append(cur)
+  if len(messages) < 2 and not saw_header:
+    return False
+  for msg in messages:
+    emit_chat_line(msg.get("ts", ""), msg.get("sender", ""), norm_text(msg.get("text", "")))
+  return True
+
 # ---------- WhatsApp TXT ----------
 WA_RE = re.compile(r"^\[?(\d{1,2}/\d{1,2}/\d{2,4}),\s+([^\]]+?)\]?\s+-\s+([^:]+):\s*(.*)$")
 
@@ -1380,10 +1496,10 @@ def handlers_for_path(path: str):
   if ext in (".json",):
     return (parse_json_any,)
   if ext in (".txt",):
-    return (parse_whatsapp_txt, parse_json_any)
+    return (parse_telegram_txt, parse_whatsapp_txt, parse_json_any)
   if ext in (".sqlite", ".sqlite3", ".db"):
     return (parse_telegram_sqlite,)
-  return (parse_json_any, parse_telegram_html, parse_whatsapp_txt, parse_telegram_sqlite)
+  return (parse_json_any, parse_telegram_html, parse_telegram_txt, parse_whatsapp_txt, parse_telegram_sqlite)
 
 def main():
   if len(sys.argv) != 2:
@@ -1425,7 +1541,7 @@ done
 
 # Split + stats
 cat >"$tmp_split" <<'PY'
-import os, sys, json
+import os, sys, json, re
 
 all_path = sys.argv[1]
 out_text = sys.argv[2]
@@ -1443,6 +1559,7 @@ have_rga_preproc = (sys.argv[12] == "1")
 min_rich_size = int(sys.argv[13])
 search_hidden = (sys.argv[14] == "1")
 chat_mode = (sys.argv[15] == "1")
+no_chat_mode = (sys.argv[16] == "1")
 
 RICH_EXTS = {"pdf","docx","sqlite","sqlite3","db","db3"}
 XLSX_EXTS = {"xlsx","xls"}
@@ -1533,6 +1650,25 @@ def looks_like_whatsapp_txt(s: bytes) -> bool:
         return True
   return False
 
+TG_TXT_RE = re.compile(r"^\s*[.\-]*\s*\d{1,2}\.\d{1,2}\.\d{2,4}\s+\d{1,2}:\d{2}:\d{2},\s+[^:]+:\s*")
+
+def looks_like_telegram_txt(s: bytes) -> bool:
+  text = s.decode("utf-8", "ignore")
+  hits = 0
+  for raw in text.splitlines()[:40]:
+    line = raw.strip()
+    if not line:
+      continue
+    if line and ord(line[0]) == 0xfeff:
+      line = line[1:]
+    if "your telegram history" in line.lower():
+      return True
+    if TG_TXT_RE.match(line):
+      hits += 1
+      if hits >= 2:
+        return True
+  return False
+
 def looks_like_generic_chat_json(obj) -> bool:
   if not isinstance(obj, list):
     return False
@@ -1546,17 +1682,23 @@ def should_route_chat(path: str, ext: str, lazy_sniff) -> bool:
   base = os.path.basename(p_low)
 
   if ext in CHAT_HTML_EXTS:
-    return True
+    if "telegram" in p_low or "facebook" in p_low or "messenger" in p_low:
+      return True
+    t = lazy_sniff().lower()
+    if b"message" in t:
+      return True
+    return False
 
   if ext in CHAT_JSON_EXTS:
-    if base.startswith(("message", "messages", "result")) or "messages" in p_low:
-      return True
     try:
       import json as _json
       data = lazy_sniff()
       t = data.lower()
       if b'"messages"' not in t and b'"message"' not in t and b'"text"' not in t and b'"content"' not in t:
         return False
+      if not (base.startswith(("message", "messages", "result")) or "messages" in p_low or "telegram" in p_low or "facebook" in p_low or "messenger" in p_low or "chat" in p_low or "whatsapp" in p_low):
+        if b'"sender"' not in t and b'"sender_name"' not in t and b'"from"' not in t and b'"actor"' not in t and b'"timestamp"' not in t and b'"date"' not in t:
+          return False
       obj = _json.loads(data.decode("utf-8", "ignore"))
       if looks_like_telegram_json(obj) or looks_like_messenger_json(obj) or looks_like_generic_chat_json(obj):
         return True
@@ -1565,14 +1707,19 @@ def should_route_chat(path: str, ext: str, lazy_sniff) -> bool:
     return False
 
   if ext in CHAT_SQLITE_EXTS:
-    if "telegram" in p_low or "database" in base:
+    if "telegram" in p_low or "database" in base or "messenger" in p_low or "whatsapp" in p_low:
+      return True
+    t = lazy_sniff().lower()
+    if b"messages" in t and (b"sender" in t or b"text" in t or b"time" in t):
       return True
     return False
 
   if ext in CHAT_TXT_EXTS:
-    if "whatsapp" in p_low or "chat" in base:
+    if "whatsapp" in p_low or "chat" in base or "messages" in p_low:
       return True
     if looks_like_whatsapp_txt(lazy_sniff()):
+      return True
+    if looks_like_telegram_txt(lazy_sniff()):
       return True
   return False
 
@@ -1585,6 +1732,7 @@ def st(ext: str):
       "attempted": 0,          # will be passed to rg/preproc
       "hidden_skipped": 0,     # excluded because hidden and SEARCH_HIDDEN=0
       "blacklisted": 0,        # extension-filtered (blisted) among eligible (non-hidden when SEARCH_HIDDEN=0)
+      "excluded": 0,           # excluded by mode (chat/nochat)
       "skipped_own": 0,        # skipped by our heuristics
       "skipped_bad_rich": 0,
       "skipped_encrypted": 0,
@@ -1626,22 +1774,30 @@ with open(out_text, "wb") as ft, open(out_rich, "wb") as fr, open(out_chat, "wb"
       sd["blacklisted"] += 1
       continue
 
+    if chat_mode or no_chat_mode:
+      sniff_data = [None]
+      def lazy_sniff():
+        if sniff_data[0] is None:
+          sniff_data[0] = sniff(p)
+        return sniff_data[0]
+
+      is_chat = should_route_chat(p, ext, lazy_sniff)
+      if is_chat:
+        if chat_mode:
+          sd["attempted"] += 1
+          write_nul(fc, p)
+        else:
+          sd["excluded"] += 1
+        continue
+      if chat_mode:
+        sd["excluded"] += 1
+        continue
+
     # Ignore Office temp/lock files for docx/xlsx/pptx (only after hidden gate, so they don't distort hidden)
     if is_office_temp(p, ext):
       sd["skipped_own"] += 1
       sd["skipped_bad_rich"] += 1
       bad.append(f"skip-office-temp(~$): {p}")
-      continue
-
-    sniff_data = [None]
-    def lazy_sniff():
-      if sniff_data[0] is None:
-        sniff_data[0] = sniff(p)
-      return sniff_data[0]
-
-    if chat_mode and should_route_chat(p, ext, lazy_sniff):
-      sd["attempted"] += 1
-      write_nul(fc, p)
       continue
 
     if ext in XLSX_EXTS:
@@ -1691,28 +1847,25 @@ PY
 if [[ "$VERBOSE" -eq 1 ]]; then
   {
     echo "window: -B $BEFORE -A $AFTER ; ctx_lines=$CTX_LINES"
-    echo "search flags: hidden=$SEARCH_HIDDEN uuu=$SEARCH_UUU binary=$SEARCH_BINARY no_ignore=$NO_IGNORE ucount=$UCOUNT"
+    echo "search flags: hidden=$SEARCH_HIDDEN uuu=$SEARCH_UUU binary=$SEARCH_BINARY no_ignore=$NO_IGNORE ucount=$UCOUNT case_sensitive=$CASE_SENSITIVE"
     echo "ext filter: mode=$EXT_FILTER_MODE"
     echo "have_rga_preproc=$HAVE_RGA_PREPROC have_xlsx2csv=$HAVE_XLSX2CSV have_pptx=$HAVE_PPTX have_doc=$HAVE_DOC"
     echo "parallel: text=$PAR_TEXT rich=$PAR_RICH xlsx=$PAR_XLSX pptx=$PAR_PPTX doc=$PAR_DOC"
     echo "batch:    text=$BATCH_TEXT rich=$BATCH_RICH xlsx=$BATCH_XLSX pptx=$BATCH_PPTX doc=$BATCH_DOC"
     echo "paths: ${PATHS[*]}"
-  } | tee -a "$DEBUG_LOG" >&2
+  } >&2
 fi
 
 MIN_RICH_SIZE=128
-if [[ "$VERBOSE" -eq 1 || "$LOUD" -eq 1 ]]; then
+if [[ "$VERBOSE" -eq 1 ]]; then
   python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
-    "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" "$CHAT_MODE" 2>&1 | tee -a "$DEBUG_LOG" >&2
+    "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" "$CHAT_MODE" "$NOCHAT" 1>&2
 else
   python3 "$tmp_split" "$tmp_all" "$tmp_text" "$tmp_rich" "$tmp_chat_list" "$tmp_xlsx_list" "$tmp_pptx_list" "$tmp_doc_list" "$tmp_bad_rich" "$tmp_stats_json" \
-    "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" "$CHAT_MODE" 2>>"$DEBUG_LOG" >/dev/null || true
+    "$EXT_FILTER_MODE" "$(IFS=,; echo "${FILTER_EXTS[*]}")" "$HAVE_RGA_PREPROC" "$MIN_RICH_SIZE" "$SEARCH_HIDDEN" "$CHAT_MODE" "$NOCHAT" 2>/dev/null >/dev/null || true
 fi
 
-# Persist bad-rich list to a stable path
-if [[ -s "$tmp_bad_rich" ]]; then
-  cp -f "$tmp_bad_rich" "$BAD_RICH_PERSIST" 2>/dev/null || true
-fi
+# Skip list persisted after rg run (heuristics + rg skips)
 
 split_nul_to_shards() {
   local in_list="$1" out_dir="$2" k="$3"
@@ -1774,12 +1927,12 @@ run_rg_json_parallel() {
   local cmd_q
   cmd_q="$(printf '%q ' "${cmd[@]}")"
 
-  [[ "$VERBOSE" -eq 1 ]] && {
+  if [[ "$VERBOSE" -eq 1 ]]; then
     {
       echo "run_rg_json_parallel: par=$par batch=$batch list=$listfile errfile=$errfile"
       printf '  cmd: %s\n' "$cmd_q"
-    } >>"$DEBUG_LOG"
-  }
+    } >&2
+  fi
 
   local -a pids=()
   local -A out_by_pid=()
@@ -1875,7 +2028,7 @@ PY
 
   if [[ -s "$tmp_chat_text_list" ]]; then
     RG_CHAT_PREFILTER=(rg "${RG_COMMON[@]}" --files-with-matches --null -- "$PATTERN")
-    if [[ "$LOUD" -eq 0 && "$VERBOSE" -eq 0 ]]; then
+    if [[ "$VERBOSE" -eq 0 ]]; then
       RG_CHAT_PREFILTER+=(--no-messages)
     fi
     if ! run_rg_json_parallel "$tmp_chat_text_list" "$PAR_TEXT" "$BATCH_TEXT" "$tmp_err_chat_prefilter" "${RG_CHAT_PREFILTER[@]}" >"$tmp_chat_prefilter"; then
@@ -1904,14 +2057,14 @@ with open(out_path, "wb") as f:
     f.write(b"\0")
 PY
   elif [[ "$VERBOSE" -eq 1 ]]; then
-    echo "chat prefilter: failed; using full chat list" >>"$DEBUG_LOG"
+    echo "chat prefilter: failed; using full chat list" >&2
   fi
 fi
 
 start_ns="$(date +%s%N)"
 
 RG_BASE=(rg "${RG_COMMON[@]}" --json --no-heading -C "$CTX_LINES" --context-separator "")
-if [[ "$LOUD" -eq 0 && "$VERBOSE" -eq 0 ]]; then
+if [[ "$VERBOSE" -eq 0 ]]; then
   RG_BASE+=(--no-messages)
 fi
 
@@ -1937,34 +2090,34 @@ RG_DOC=()
   if [[ "$CHAT_MODE" -eq 1 ]]; then
     run_rg_json_parallel "$tmp_chat_list" "$PAR_TEXT" "$BATCH_TEXT" "$tmp_err_chat" "${RG_CHAT[@]}"; r=$?
     [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
-  fi
-
-  run_rg_json_parallel "$tmp_text" "$PAR_TEXT" "$BATCH_TEXT" "$tmp_err_text" "${RG_TEXT[@]}"; r=$?
-  [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
-
-  if [[ -s "$tmp_rich" && "$HAVE_RGA_PREPROC" -eq 1 ]]; then
-    run_rg_json_parallel "$tmp_rich" "$PAR_RICH" "$BATCH_RICH" "$tmp_err_rich" "${RG_RICH[@]}"; r=$?
+  else
+    run_rg_json_parallel "$tmp_text" "$PAR_TEXT" "$BATCH_TEXT" "$tmp_err_text" "${RG_TEXT[@]}"; r=$?
     [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
-  fi
 
-  if [[ ${#RG_XLSX[@]} -gt 0 ]]; then
-    run_rg_json_parallel "$tmp_xlsx_list" "$PAR_XLSX" "$BATCH_XLSX" "$tmp_err_xlsx" "${RG_XLSX[@]}"; r=$?
-    [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
-  fi
+    if [[ -s "$tmp_rich" && "$HAVE_RGA_PREPROC" -eq 1 ]]; then
+      run_rg_json_parallel "$tmp_rich" "$PAR_RICH" "$BATCH_RICH" "$tmp_err_rich" "${RG_RICH[@]}"; r=$?
+      [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
+    fi
 
-  if [[ ${#RG_PPTX[@]} -gt 0 ]]; then
-    run_rg_json_parallel "$tmp_pptx_list" "$PAR_PPTX" "$BATCH_PPTX" "$tmp_err_pptx" "${RG_PPTX[@]}"; r=$?
-    [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
-  fi
+    if [[ ${#RG_XLSX[@]} -gt 0 ]]; then
+      run_rg_json_parallel "$tmp_xlsx_list" "$PAR_XLSX" "$BATCH_XLSX" "$tmp_err_xlsx" "${RG_XLSX[@]}"; r=$?
+      [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
+    fi
 
-  if [[ ${#RG_DOC[@]} -gt 0 ]]; then
-    run_rg_json_parallel "$tmp_doc_list" "$PAR_DOC" "$BATCH_DOC" "$tmp_err_doc" "${RG_DOC[@]}"; r=$?
-    [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
+    if [[ ${#RG_PPTX[@]} -gt 0 ]]; then
+      run_rg_json_parallel "$tmp_pptx_list" "$PAR_PPTX" "$BATCH_PPTX" "$tmp_err_pptx" "${RG_PPTX[@]}"; r=$?
+      [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
+    fi
+
+    if [[ ${#RG_DOC[@]} -gt 0 ]]; then
+      run_rg_json_parallel "$tmp_doc_list" "$PAR_DOC" "$BATCH_DOC" "$tmp_err_doc" "${RG_DOC[@]}"; r=$?
+      [[ "$r" -ge 2 ]] && warn_groups=$((warn_groups+1))
+    fi
   fi
 
   echo "$warn_groups" >"$tmp_rc2"
   exit 0
-) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$CHAT_MODE" "$tmp_chat"
+) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$tmp_chat" "$tmp_skip_rg"
 
 end_ns="$(date +%s%N)"
 
@@ -2034,25 +2187,30 @@ with open(out_fail, "w", encoding="utf-8", errors="replace") as out:
     out.write("----\n")
 PY
 
-python3 "$tmp_failparse" "$tmp_err_text" "$FAIL_TEXT_PERSIST" || true
-python3 "$tmp_failparse" "$tmp_err_chat" "$FAIL_CHAT_PERSIST" || true
-python3 "$tmp_failparse" "$tmp_err_rich" "$FAIL_RICH_PERSIST" || true
-python3 "$tmp_failparse" "$tmp_err_xlsx" "$FAIL_XLSX_PERSIST" || true
-python3 "$tmp_failparse" "$tmp_err_pptx" "$FAIL_PPTX_PERSIST" || true
-python3 "$tmp_failparse" "$tmp_err_doc"  "$FAIL_DOC_PERSIST"  || true
+: >"$FAIL_PERSIST"
+for err in "$tmp_err_text" "$tmp_err_chat" "$tmp_err_rich" "$tmp_err_xlsx" "$tmp_err_pptx" "$tmp_err_doc"; do
+  python3 "$tmp_failparse" "$err" "$tmp_fail_out" || true
+  if [[ -s "$tmp_fail_out" ]]; then
+    cat "$tmp_fail_out" >>"$FAIL_PERSIST"
+  fi
+done
 
-if [[ -s "$BAD_RICH_PERSIST" && ( "$LOUD" -eq 1 || "$VERBOSE" -eq 1 ) ]]; then
-  echo "[g] note: some files were skipped by heuristics; see: $BAD_RICH_PERSIST" >&2
+# Persist skip list (heuristics + rg skips)
+: >"$SKIP_PERSIST"
+if [[ -s "$tmp_bad_rich" ]]; then
+  cat "$tmp_bad_rich" >>"$SKIP_PERSIST"
+fi
+if [[ -s "$tmp_skip_rg" ]]; then
+  cat "$tmp_skip_rg" >>"$SKIP_PERSIST"
+fi
+
+if [[ -s "$SKIP_PERSIST" && "$VERBOSE" -eq 1 ]]; then
+  echo "[g] note: some files were skipped; see: $SKIP_PERSIST" >&2
 fi
 if [[ "$warn_groups" -gt 0 ]]; then
   echo "[g] warnings: ${warn_groups} group(s) reported rc>=2 at least once (extraction/IO errors). Matches (if any) were still reported." >&2
   echo "[g] failed-file logs:" >&2
-  echo "  $FAIL_TEXT_PERSIST" >&2
-  echo "  $FAIL_CHAT_PERSIST" >&2
-  echo "  $FAIL_RICH_PERSIST" >&2
-  echo "  $FAIL_XLSX_PERSIST" >&2
-  echo "  $FAIL_PPTX_PERSIST" >&2
-  echo "  $FAIL_DOC_PERSIST" >&2
+  echo "  $FAIL_PERSIST" >&2
 fi
 
 # ------------------------------------------------------------
@@ -2063,7 +2221,7 @@ cat >"$tmp_vsum" <<'PY'
 import json, os, sys
 from collections import defaultdict
 
-stats_path, fail_text, fail_chat, fail_rich, fail_doc, fail_xlsx, fail_pptx = sys.argv[1:8]
+stats_path, fail_path, skip_rg_path = sys.argv[1:4]
 
 def ext_of(path: str) -> str:
   base = os.path.basename(path)
@@ -2098,18 +2256,32 @@ def ingest_fail(p):
   except Exception:
     pass
 
-ingest_fail(fail_text)
-ingest_fail(fail_chat)
-ingest_fail(fail_rich)
-ingest_fail(fail_doc)
-ingest_fail(fail_xlsx)
-ingest_fail(fail_pptx)
+ingest_fail(fail_path)
+
+skip_rg = defaultdict(int)
+def ingest_skip_rg(p):
+  try:
+    with open(p, "r", encoding="utf-8", errors="replace") as f:
+      for raw in f:
+        line = raw.strip()
+        if not line:
+          continue
+        path = line
+        if ":" in line:
+          _, path = line.split(":", 1)
+          path = path.strip()
+        if path:
+          skip_rg[ext_of(path)] += 1
+  except Exception:
+    pass
+
+ingest_skip_rg(skip_rg_path)
 
 rows = []
-tot_scanned = tot_hidden = tot_blisted = tot_skipped = tot_skipped_rg = tot_failed = 0
+tot_scanned = tot_hidden = tot_blisted = tot_excluded = tot_skipped = tot_failed = 0
 tot_files = 0
 
-all_exts = set(ext_stats.keys()) | set(fail.keys())
+all_exts = set(ext_stats.keys()) | set(fail.keys()) | set(skip_rg.keys())
 
 for ext in all_exts:
   d = ext_stats.get(ext, {}) or {}
@@ -2120,26 +2292,28 @@ for ext in all_exts:
   scanned = int(d.get("attempted", 0) or 0)
   hidden  = int(d.get("hidden_skipped", 0) or 0)
   blisted = int(d.get("blacklisted", 0) or 0)
-  skipped = int(d.get("skipped_own", 0) or 0)
-  skipped_rg = 0
+  excluded = int(d.get("excluded", 0) or 0)
+  skipped_own = int(d.get("skipped_own", 0) or 0)
+  skipped_rg = int(skip_rg.get(ext, 0) or 0)
+  skipped = skipped_own + skipped_rg
   failed  = int(fail.get(ext, 0) or 0)
 
-  if (scanned + hidden + blisted + skipped + failed + skipped_rg) <= 0:
+  if (scanned + hidden + blisted + excluded + skipped + failed) <= 0:
     continue
 
-  rows.append((ext, scanned, hidden, blisted, skipped, skipped_rg, failed))
+  rows.append((ext, scanned, hidden, blisted, excluded, skipped, failed))
 
   tot_scanned += scanned
   tot_hidden  += hidden
   tot_blisted += blisted
+  tot_excluded += excluded
   tot_skipped += skipped
-  tot_skipped_rg += skipped_rg
   tot_failed += failed
 
 def key(r):
-  ext, scn, hid, bl, sk, skr, fl = r
-  tot = scn + hid + bl + sk + skr
-  return (-tot, -scn, -hid, -bl, -sk, -skr, -fl, ext)
+  ext, scn, hid, bl, ex, sk, fl = r
+  tot = scn + hid + bl + ex + sk
+  return (-tot, -scn, -hid, -bl, -ex, -sk, -fl, ext)
 
 rows.sort(key=key)
 
@@ -2155,23 +2329,23 @@ print(f"files:     {tot_files}")
 print(f"scanned:   {tot_scanned}")
 print(f"hidden:    {tot_hidden}")
 print(f"blisted:   {tot_blisted}")
+print(f"excluded:  {tot_excluded}")
 print(f"skipped:   {tot_skipped}")
-print(f"skipped_rg:{tot_skipped_rg}")
 print(f"failed:    {tot_failed}")
 print("---- end scan totals ----\n")
 
 print("---- per-extension scan summary (top 100) ----")
-print(f"{'ext':<{W}} {fmt_cell('scanned')} {fmt_cell('hidden')} {fmt_cell('blisted')} {fmt_cell('skipped')} {fmt_cell('skp_rg')} {fmt_cell('failed')}")
+print(f"{'ext':<{W}} {fmt_cell('scanned')} {fmt_cell('hidden')} {fmt_cell('blisted')} {fmt_cell('exclude')} {fmt_cell('skipped')} {fmt_cell('failed')}")
 
-for i, (ext, scn, hid, bl, sk, skr, fl) in enumerate(rows, start=1):
+for i, (ext, scn, hid, bl, ex, sk, fl) in enumerate(rows, start=1):
   if i <= TOPN:
-    print(f"{fmt_ext(ext)} {scn:>{W}d} {hid:>{W}d} {bl:>{W}d} {sk:>{W}d} {skr:>{W}d} {fl:>{W}d}")
+    print(f"{fmt_ext(ext)} {scn:>{W}d} {hid:>{W}d} {bl:>{W}d} {ex:>{W}d} {sk:>{W}d} {fl:>{W}d}")
   else:
     other[0] += scn
     other[1] += hid
     other[2] += bl
-    other[3] += sk
-    other[4] += skr
+    other[3] += ex
+    other[4] += sk
     other[5] += fl
 
 if len(rows) > TOPN:
@@ -2180,8 +2354,7 @@ if len(rows) > TOPN:
 print("---- end per-extension scan summary ----\n")
 PY
 
-  python3 "$tmp_vsum" "$tmp_stats_json" "$FAIL_TEXT_PERSIST" "$FAIL_CHAT_PERSIST" "$FAIL_RICH_PERSIST" "$FAIL_DOC_PERSIST" "$FAIL_XLSX_PERSIST" "$FAIL_PPTX_PERSIST" \
-    | tee -a "$DEBUG_LOG" >&2
+  python3 "$tmp_vsum" "$tmp_stats_json" "$FAIL_PERSIST" "$tmp_skip_rg" 1>&2
 fi
 
 if [[ "$match_count" -gt 0 ]]; then

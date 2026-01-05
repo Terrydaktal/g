@@ -1,1 +1,7 @@
 g.debug.log*
+g.fail.log
+g.skipped.log
+g.match_files.log
+makeup
+socialmindset
+socialmindset1
