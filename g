@@ -51,7 +51,7 @@ usage() {
   cat <<'EOF'
 Usage:
   g --audit [PATH...]
-  g [--hidden] [--uuu] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
+  g [--hidden] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
 
 Modes:
   --audit        Fast audit: counts hidden vs non-hidden by extension (fd + gawk only)
@@ -61,8 +61,7 @@ Search flags:
   --hidden       include hidden files/dirs (fd -H and rg --hidden)
   -u             include hidden
   -uu            include hidden + no ignore (maps to --no_ignore)
-  -uuu           include hidden + no-ignore + binary/text + --uuu
-  --uuu          same as -uuu (include hidden + no-ignore + binary/text + --uuu)
+  -uuu           include hidden + no-ignore + binary/text
   --no_ignore    do not respect ignore files (rg --no-ignore, fd --no-ignore)
   --binary       treat binary files as text (rg --text)
   --case-sensitive    force case sensitive search (default: case-insensitive)
@@ -151,31 +150,9 @@ for idx in "${!args[@]}"; do
       filtered+=("${args[@]:$idx}")
       break
       ;;
-    -B|-A|-C)
-      next_idx=$((idx + 1))
-      next_val="${args[$next_idx]:-}"
-      if [[ -z "$next_val" ]]; then
-        echo "Error: option $arg requires an argument" >&2
-        exit 2
-      fi
-      case "$arg" in
-        -B) BEFORE="$next_val" ;;
-        -A) AFTER="$next_val" ;;
-        -C) BEFORE="$next_val"; AFTER="$next_val" ;;
-      esac
-      skip_next=1
-      continue
-      ;;
     --audit) AUDIT=1; continue ;;
+    --help) usage; exit 0 ;;
     --hidden) SEARCH_HIDDEN=1; continue ;;
-    --uuu|-uuu|---uuu)
-      SEARCH_UUU=1
-      SEARCH_HIDDEN=1
-      NO_IGNORE=1
-      SEARCH_BINARY=1
-      [[ "$UCOUNT" -lt 3 ]] && UCOUNT=3
-      continue
-      ;;
     --binary|--text) SEARCH_BINARY=1; continue ;;
     --no_ignore|--no-ignore) NO_IGNORE=1; continue ;;
     --nochat) NOCHAT=1; continue ;;
@@ -201,6 +178,59 @@ for idx in "${!args[@]}"; do
         *) echo "Error: unknown value for --chat-ts (use keep|drop)" >&2; exit 2 ;;
       esac
       continue ;;
+    --*)
+      echo "Error: unknown option $arg" >&2
+      usage
+      exit 2
+      ;;
+    -)
+      filtered+=("$arg")
+      continue
+      ;;
+    -*)
+      short="${arg#-}"
+      i=0
+      while [[ $i -lt ${#short} ]]; do
+        ch="${short:$i:1}"
+        case "$ch" in
+          u) UCOUNT=$((UCOUNT + 1)) ;;
+          v) VERBOSE=1 ;;
+          h) usage; exit 0 ;;
+          B|A|C)
+            if [[ $((i + 1)) -lt ${#short} ]]; then
+              next_val="${short:$((i + 1))}"
+              case "$ch" in
+                B) BEFORE="$next_val" ;;
+                A) AFTER="$next_val" ;;
+                C) BEFORE="$next_val"; AFTER="$next_val" ;;
+              esac
+              i=${#short}
+              continue
+            fi
+            next_idx=$((idx + 1))
+            next_val="${args[$next_idx]:-}"
+            if [[ -z "$next_val" ]]; then
+              echo "Error: option -$ch requires an argument" >&2
+              usage
+              exit 2
+            fi
+            case "$ch" in
+              B) BEFORE="$next_val" ;;
+              A) AFTER="$next_val" ;;
+              C) BEFORE="$next_val"; AFTER="$next_val" ;;
+            esac
+            skip_next=1
+            ;;
+          *)
+            echo "Error: unknown option -$ch" >&2
+            usage
+            exit 2
+            ;;
+        esac
+        i=$((i + 1))
+      done
+      continue
+      ;;
   esac
   filtered+=("$arg")
 done
@@ -219,13 +249,6 @@ while getopts ":B:A:C:vhu-:" opt; do
         help) usage; exit 0 ;;
         audit) AUDIT=1 ;;
         hidden) SEARCH_HIDDEN=1 ;;
-        uuu)
-          SEARCH_UUU=1
-          SEARCH_HIDDEN=1
-          NO_IGNORE=1
-          SEARCH_BINARY=1
-          [[ "$UCOUNT" -lt 3 ]] && UCOUNT=3
-          ;;
         binary|text) SEARCH_BINARY=1 ;;
         no_ignore|no-ignore) NO_IGNORE=1 ;;
         nochat) NOCHAT=1 ;;
