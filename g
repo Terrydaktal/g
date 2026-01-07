@@ -1444,6 +1444,43 @@ def parse_generic_json(path: str) -> bool:
     return False
   return emit_generic_messages(obj) > 0
 
+def parse_gemini_json(path: str) -> bool:
+  try:
+    obj = json.load(open(path, "r", encoding="utf-8"))
+  except Exception:
+    return False
+  if not isinstance(obj, dict) or "messages" not in obj:
+    return False
+  msgs = obj.get("messages")
+  if not isinstance(msgs, list):
+    return False
+  if "projectHash" not in obj and "sessionId" not in obj:
+    return False
+
+  emitted = 0
+  for msg in msgs:
+    if not isinstance(msg, dict):
+      continue
+    ts = msg.get("timestamp", "")
+    typ = msg.get("type", "")
+    content = msg.get("content", "")
+
+    tcs = msg.get("toolCalls", [])
+    if tcs:
+        call_names = [f"[{tc.get('name', 'tool')}]" for tc in tcs]
+        t_str = " ".join(call_names)
+        content = (content + " " + t_str).strip()
+
+    sender = typ
+    if typ == "gemini":
+        model = msg.get("model")
+        if model:
+            sender = model
+
+    emit_chat_line(ts, sender, norm_text(content))
+    emitted += 1
+  return emitted > 0
+
 def _codex_text_from_content(content):
   parts = []
   if isinstance(content, list):
@@ -1590,7 +1627,7 @@ def handlers_for_path(path: str):
   if ext in (".jsonl",):
     return (parse_codex_jsonl,)
   if ext in (".json",):
-    return (parse_json_any,)
+    return (parse_gemini_json, parse_json_any)
   if ext in (".txt",):
     return (parse_telegram_txt, parse_whatsapp_txt, parse_json_any)
   if ext in (".sqlite", ".sqlite3", ".db"):
@@ -1775,6 +1812,9 @@ def looks_like_generic_chat_json(obj) -> bool:
       return True
   return False
 
+def looks_like_gemini_json(obj) -> bool:
+  return isinstance(obj, dict) and isinstance(obj.get("messages"), list) and ("sessionId" in obj or "projectHash" in obj)
+
 def looks_like_codex_jsonl(s: bytes, p_low: str) -> bool:
   if b'"type":"response_item"' in s or b'"type":"event_msg"' in s:
     if b'"payload"' in s and b'"timestamp"' in s:
@@ -1813,7 +1853,13 @@ def should_route_chat(path: str, ext: str, lazy_sniff):
       if not (base.startswith(("message", "messages", "result")) or "messages" in p_low or "telegram" in p_low or "facebook" in p_low or "messenger" in p_low or "chat" in p_low or "whatsapp" in p_low):
         if b'"sender"' not in t and b'"sender_name"' not in t and b'"from"' not in t and b'"actor"' not in t and b'"timestamp"' not in t and b'"date"' not in t:
           return False
+
+      if b'"messages"' in t and (b'"sessionid"' in t or b'"projecthash"' in t):
+        return "aichat"
+
       obj = _json.loads(data.decode("utf-8", "ignore"))
+      if looks_like_gemini_json(obj):
+        return "aichat"
       if looks_like_telegram_json(obj) or looks_like_messenger_json(obj) or looks_like_generic_chat_json(obj):
         return "chat"
     except Exception:
