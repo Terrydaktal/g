@@ -15,6 +15,7 @@ NOCHAT=0
 SEARCH_HIDDEN=0
 SEARCH_UUU=0
 SEARCH_BINARY=0
+FIXED_STRINGS=0
 NO_IGNORE=0
 UCOUNT=0
 CASE_SENSITIVE=0
@@ -51,7 +52,7 @@ usage() {
   cat <<'EOF'
 Usage:
   g --audit [PATH...]
-  g [--hidden] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
+  g [--hidden] [-l|--literal] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
 
 Modes:
   --audit        Fast audit: counts hidden vs non-hidden by extension (fd + gawk only)
@@ -59,6 +60,7 @@ Modes:
 
 Search flags:
   --hidden       include hidden files/dirs (fd -H and rg --hidden)
+  -l, --literal  make search term literal rather than regex (regex is default)
   -u             include hidden
   -uu            include hidden + no ignore (maps to --no_ignore)
   -uuu           include hidden + no-ignore + binary/text
@@ -160,6 +162,7 @@ for idx in "${!args[@]}"; do
     --blacklist) EXT_FILTER_MODE="blacklist"; continue ;;
     --chat) CHAT_MODE=1; continue ;;
     --case-sensitive) CASE_SENSITIVE=1; continue ;;
+    --literal) FIXED_STRINGS=1; continue ;;
     --chat-prefilter) CHAT_PREFILTER=1; continue ;;
     --no-chat-prefilter) CHAT_PREFILTER=0; continue ;;
     --chat-prefilter=*)
@@ -194,6 +197,7 @@ for idx in "${!args[@]}"; do
         ch="${short:$i:1}"
         case "$ch" in
           u) UCOUNT=$((UCOUNT + 1)) ;;
+          l) FIXED_STRINGS=1 ;;
           v) VERBOSE=1 ;;
           h) usage; exit 0 ;;
           B|A|C)
@@ -236,7 +240,7 @@ for idx in "${!args[@]}"; do
 done
 set -- "${filtered[@]}"
 
-while getopts ":B:A:C:vhu-:" opt; do
+while getopts ":B:A:C:vhul-:" opt; do
   case "$opt" in
     B) BEFORE="$OPTARG" ;;
     A) AFTER="$OPTARG" ;;
@@ -244,11 +248,13 @@ while getopts ":B:A:C:vhu-:" opt; do
     v) VERBOSE=1 ;;
     h) usage; exit 0 ;;
     u) UCOUNT=$((UCOUNT + 1)) ;;
+    l) FIXED_STRINGS=1 ;;
     -)
       case "${OPTARG}" in
         help) usage; exit 0 ;;
         audit) AUDIT=1 ;;
         hidden) SEARCH_HIDDEN=1 ;;
+        literal) FIXED_STRINGS=1 ;;
         binary|text) SEARCH_BINARY=1 ;;
         no_ignore|no-ignore) NO_IGNORE=1 ;;
         nochat) NOCHAT=1 ;;
@@ -436,7 +442,8 @@ fi
 # -----------------------------
 [[ $# -ge 1 ]] || { usage; exit 2; }
 PATTERN="$1"; shift
-PATTERN="$(python3 - "$PATTERN" <<'PY'
+if [[ "$FIXED_STRINGS" -eq 0 ]]; then
+  PATTERN="$(python3 - "$PATTERN" <<'PY'
 import re, sys
 
 pat = sys.argv[1]
@@ -444,10 +451,16 @@ pat = re.sub(r'(?<!\\)\\x(?![0-9A-Fa-f{])', r'\\b\\w+\\b', pat)
 print(pat)
 PY
 )"
+fi
 PATHS=("$@")
 [[ ${#PATHS[@]} -gt 0 ]] || PATHS=(".")
 
-RG_COMMON=(--no-fixed-strings)
+if [[ "$FIXED_STRINGS" -eq 1 ]]; then
+  RG_COMMON=(--fixed-strings)
+else
+  RG_COMMON=(--no-fixed-strings)
+fi
+
 if [[ "$CASE_SENSITIVE" -eq 0 ]]; then
   RG_COMMON+=(--ignore-case)
 fi
