@@ -21,9 +21,10 @@ UCOUNT=0
 CASE_SENSITIVE=0
 
 EXT_FILTER_MODE="all"  # all|whitelist|blacklist
-FAIL_LOG="${G_FAIL_LOG:-g.fail.log}"
-SKIP_LOG="${G_SKIP_LOG:-g.skipped.log}"
-MATCH_FILES_LOG="${G_MATCH_FILES_LOG:-g.match_files.log}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FAIL_LOG="${G_FAIL_LOG:-$SCRIPT_DIR/g.fail.log}"
+SKIP_LOG="${G_SKIP_LOG:-$SCRIPT_DIR/g.skipped.log}"
+MATCH_FILES_LOG="${G_MATCH_FILES_LOG:-$SCRIPT_DIR/g.match_files.log}"
 
 case "${CHAT_PREFILTER,,}" in
   0|false|no|off) CHAT_PREFILTER=0 ;;
