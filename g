@@ -329,6 +329,9 @@ FILTER_EXTS=(
   py sh bash zsh fish c h cpp hpp cc cxx java kt go rs js mjs cjs ts tsx jsx php rb pl
   pdf docx doc xlsx xls pptx ppt sqlite sqlite3 db db3
 )
+FD_EXCLUDE_PATTERNS=(
+  "remote-server"
+)
 
 CTX_LINES=$((BEFORE + AFTER + 20))
 
@@ -350,6 +353,9 @@ if [[ "$AUDIT" -eq 1 ]]; then
   [[ ${#AUDIT_TARGETS[@]} -gt 0 ]] || AUDIT_TARGETS=(".")
 
   FD_ARGS=(-0 -t f -H)
+  for pat in "${FD_EXCLUDE_PATTERNS[@]}"; do
+    FD_ARGS+=(--exclude "$pat")
+  done
   [[ "$NO_IGNORE" -eq 1 ]] && FD_ARGS+=(--no-ignore)
 
   FILTER_LIST="$(IFS=' '; echo "${FILTER_EXTS[*]}")"
@@ -1681,6 +1687,9 @@ for p in "${PATHS[@]}"; do
     printf '%s\0' "$p" >>"$tmp_all"
   elif [[ -d "$p" ]]; then
     FD_ARGS=(-0 -t f -H)
+    for pat in "${FD_EXCLUDE_PATTERNS[@]}"; do
+      FD_ARGS+=(--exclude "$pat")
+    done
     [[ "$NO_IGNORE" -eq 1 ]] && FD_ARGS+=(--no-ignore)
     fd "${FD_ARGS[@]}" . "$p" 2>/dev/null >>"$tmp_all" || true
   fi
