@@ -543,9 +543,10 @@ match_count_path = sys.argv[4]
 match_files_path = sys.argv[5] if len(sys.argv) > 5 else ""
 chat_mode = (len(sys.argv) > 6 and sys.argv[6] == "1")
 
-RED   = "\x1b[31m"
-GREEN = "\x1b[32m"
-RESET = "\x1b[0m"
+RED        = "\x1b[31m"
+GREEN      = "\x1b[32m"
+LIGHT_BLUE = "\x1b[38;2;122;218;247m"
+RESET      = "\x1b[0m"
 
 match_no = 0
 match_files = {}
@@ -864,7 +865,7 @@ for raw in sys.stdin:
         start_ln = ln - before
         end_ln = ln + after
         match_no += 1
-        print(f"{GREEN}{match_no}{RESET} {path}:{ln}:")
+        print(f"{GREEN}{match_no}{RESET} {LIGHT_BLUE}{path} {ln}:{RESET}")
         for n in all_line_nos:
           if n < start_ln or n > end_ln:
             continue
@@ -880,7 +881,6 @@ for raw in sys.stdin:
         if missing_after:
           for msg, sender, ts in read_next_chat_lines(path, missing_after):
             print(f"{{{msg},{sender},{ts}}}")
-        print("")
         continue
 
       local_nos = [n for n in all_line_nos if abs(n - ln) <= ctx_lines]
@@ -922,7 +922,7 @@ for raw in sys.stdin:
       ts = ts_map.get(ln, "")
       ts_prefix = f"{ts} | " if ts else ""
       match_no += 1
-      print(f"{GREEN}{match_no}{RESET} {path}:{ln}: {ts_prefix}{snippet}\n")
+      print(f"{GREEN}{match_no}{RESET} {LIGHT_BLUE}{path} {ln}:{RESET} {ts_prefix}{snippet}")
 
     if matches:
       match_files[path] = len(matches)
