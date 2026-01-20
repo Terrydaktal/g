@@ -22,9 +22,10 @@ CASE_SENSITIVE=0
 
 EXT_FILTER_MODE="all"  # all|whitelist|blacklist
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FAIL_LOG="${G_FAIL_LOG:-$SCRIPT_DIR/g.fail.log}"
-SKIP_LOG="${G_SKIP_LOG:-$SCRIPT_DIR/g.skipped.log}"
-MATCH_FILES_LOG="${G_MATCH_FILES_LOG:-$SCRIPT_DIR/g.match_files.log}"
+LOG_DIR="${G_LOG_DIR:-$SCRIPT_DIR}"
+FAIL_LOG="${G_FAIL_LOG:-$LOG_DIR/g.fail.log}"
+SKIP_LOG="${G_SKIP_LOG:-$LOG_DIR/g.skipped.log}"
+MATCH_FILES_LOG="${G_MATCH_FILES_LOG:-$LOG_DIR/g.match_files.log}"
 
 case "${CHAT_PREFILTER,,}" in
   0|false|no|off) CHAT_PREFILTER=0 ;;
@@ -78,8 +79,8 @@ Pattern:
   Example: '\bayman\b' matches the word ayman.
 
 Options:
-  -B N           words before match (default 10)
-  -A N           words after match  (default 10)
+  -B N           chars before match (default 10)
+  -A N           chars after match  (default 10)
   -C N           set both -B and -A to N
   -v             verbose (end-of-run per-extension scan summary)
   --chat         search chat exports only (in chat mode -B/-A/-C are message counts)
@@ -498,22 +499,22 @@ tmp_xlsx_list="$(mktemp -t g_xlsx_list.XXXXXX.bin)"
 tmp_pptx_list="$(mktemp -t g_pptx_list.XXXXXX.bin)"
 tmp_doc_list="$(mktemp -t g_doc_list.XXXXXX.bin)"
 
-tmp_bad_rich="$(mktemp -t g_bad_rich.XXXXXX.txt)"
-tmp_stats_json="$(mktemp -t g_stats.XXXXXX.json)"
+tmp_bad_rich="$(mktemp -p "$LOG_DIR" g_bad_rich.XXXXXX.txt)"
+tmp_stats_json="$(mktemp -p "$LOG_DIR" g_stats.XXXXXX.json)"
 
 tmp_rc2="$(mktemp -t g_rc2.XXXXXX)"
 tmp_mc="$(mktemp -t g_mc.XXXXXX)"
 tmp_shards_root="$(mktemp -d -t g_shards_root.XXXXXX)"
 
-tmp_err_text="$(mktemp -t g_err_text.XXXXXX.txt)"
-tmp_err_rich="$(mktemp -t g_err_rich.XXXXXX.txt)"
-tmp_err_chat="$(mktemp -t g_err_chat.XXXXXX.txt)"
-tmp_err_chat_prefilter="$(mktemp -t g_err_chat_prefilter.XXXXXX.txt)"
-tmp_err_xlsx="$(mktemp -t g_err_xlsx.XXXXXX.txt)"
-tmp_err_pptx="$(mktemp -t g_err_pptx.XXXXXX.txt)"
-tmp_err_doc="$(mktemp -t g_err_doc.XXXXXX.txt)"
-tmp_skip_rg="$(mktemp -t g_skip_rg.XXXXXX.txt)"
-tmp_fail_out="$(mktemp -t g_fail_out.XXXXXX.txt)"
+tmp_err_text="$(mktemp -p "$LOG_DIR" g_err_text.XXXXXX.txt)"
+tmp_err_rich="$(mktemp -p "$LOG_DIR" g_err_rich.XXXXXX.txt)"
+tmp_err_chat="$(mktemp -p "$LOG_DIR" g_err_chat.XXXXXX.txt)"
+tmp_err_chat_prefilter="$(mktemp -p "$LOG_DIR" g_err_chat_prefilter.XXXXXX.txt)"
+tmp_err_xlsx="$(mktemp -p "$LOG_DIR" g_err_xlsx.XXXXXX.txt)"
+tmp_err_pptx="$(mktemp -p "$LOG_DIR" g_err_pptx.XXXXXX.txt)"
+tmp_err_doc="$(mktemp -p "$LOG_DIR" g_err_doc.XXXXXX.txt)"
+tmp_skip_rg="$(mktemp -p "$LOG_DIR" g_skip_rg.XXXXXX.txt)"
+tmp_fail_out="$(mktemp -p "$LOG_DIR" g_fail_out.XXXXXX.txt)"
 
 FAIL_PERSIST="$FAIL_LOG"
 SKIP_PERSIST="$SKIP_LOG"
@@ -542,7 +543,6 @@ match_count_path = sys.argv[4]
 match_files_path = sys.argv[5] if len(sys.argv) > 5 else ""
 chat_mode = (len(sys.argv) > 6 and sys.argv[6] == "1")
 
-token_re = re.compile(r"\S+")
 RED   = "\x1b[31m"
 GREEN = "\x1b[32m"
 RESET = "\x1b[0m"
@@ -563,9 +563,6 @@ def byte_to_char_index(s: str, byte_idx: int) -> int:
     if b >= byte_idx:
       return i + 1
   return len(s)
-
-def tokens_with_spans(s: str):
-  return [(m.start(), m.end()) for m in token_re.finditer(s)]
 
 def highlight_spans(s: str, spans):
   if not spans:
@@ -915,35 +912,12 @@ for raw in sys.stdin:
       m_start = base + s_char
       m_end   = base + e_char
 
-      toks = tokens_with_spans(combined)
-      if not toks:
-        continue
-
-      first_idx = None
-      last_idx = None
-      for i, (a, b) in enumerate(toks):
-        if b <= m_start:
-          continue
-        if a >= m_end:
-          if first_idx is None:
-            first_idx = i
-            last_idx = i
-          break
-        if first_idx is None:
-          first_idx = i
-        last_idx = i
-
-      if first_idx is None:
-        first_idx = 0
-        last_idx = 0
-
-      lo = max(0, first_idx - before)
-      hi = min(len(toks), last_idx + after + 1)
-
-      snippet = " ".join(combined[a:b] for (a, b) in toks[lo:hi])
-
-      if mtxt:
-        snippet = snippet.replace(mtxt, f"{RED}{mtxt}{RESET}", 1)
+      lo = max(0, m_start - before)
+      hi = min(len(combined), m_end + after)
+      snippet_text = combined[lo:hi]
+      rel_start = m_start - lo
+      rel_end = m_end - lo
+      snippet = snippet_text[:rel_start] + RED + snippet_text[rel_start:rel_end] + RESET + snippet_text[rel_end:]
 
       ts = ts_map.get(ln, "")
       ts_prefix = f"{ts} | " if ts else ""
