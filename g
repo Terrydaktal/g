@@ -21,7 +21,16 @@ UCOUNT=0
 CASE_SENSITIVE=0
 
 EXT_FILTER_MODE="all"  # all|whitelist|blacklist
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Resolve true script directory (handling symlinks)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+
 LOG_DIR="${G_LOG_DIR:-$SCRIPT_DIR}"
 FAIL_LOG="${G_FAIL_LOG:-$LOG_DIR/g.fail.log}"
 SKIP_LOG="${G_SKIP_LOG:-$LOG_DIR/g.skipped.log}"
