@@ -19,6 +19,7 @@ FIXED_STRINGS=0
 NO_IGNORE=0
 UCOUNT=0
 CASE_SENSITIVE=0
+COUNTS_ONLY=0
 
 EXT_FILTER_MODE="all"  # all|whitelist|blacklist
 
@@ -63,7 +64,7 @@ usage() {
   cat <<'EOF'
 Usage:
   g --audit [PATH...]
-  g [--hidden] [-l|--literal] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
+  g [--hidden] [-l|--literal] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [--counts] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
 
 Modes:
   --audit        Fast audit: counts hidden vs non-hidden by extension (fd + gawk only)
@@ -77,6 +78,7 @@ Search flags:
   -uuu           include hidden + no-ignore + binary/text
   --no_ignore    do not respect ignore files (rg --no-ignore, fd --no-ignore)
   --binary       treat binary files as text (rg --text)
+  --counts       output only per-file match counts (tsv: count<TAB>path)
   --case-sensitive    force case sensitive search (default: case-insensitive)
   --nochat       exclude files classified as chat from normal search
   --whitelist    only scan extensions in the hardcoded list
@@ -172,6 +174,7 @@ for idx in "${!args[@]}"; do
     --whitelist) EXT_FILTER_MODE="whitelist"; continue ;;
     --blacklist) EXT_FILTER_MODE="blacklist"; continue ;;
     --chat) CHAT_MODE=1; continue ;;
+    --counts) COUNTS_ONLY=1; continue ;;
     --case-sensitive) CASE_SENSITIVE=1; continue ;;
     --literal) FIXED_STRINGS=1; continue ;;
     --chat-prefilter) CHAT_PREFILTER=1; continue ;;
@@ -272,6 +275,7 @@ while getopts ":B:A:C:vhul-:" opt; do
         whitelist) EXT_FILTER_MODE="whitelist" ;;
         blacklist) EXT_FILTER_MODE="blacklist" ;;
         chat) CHAT_MODE=1 ;;
+        counts) COUNTS_ONLY=1 ;;
         case-sensitive) CASE_SENSITIVE=1 ;;
         chat-prefilter) CHAT_PREFILTER=1 ;;
         no-chat-prefilter) CHAT_PREFILTER=0 ;;
@@ -528,6 +532,8 @@ tmp_fail_out="$(mktemp -p "$LOG_DIR" g_fail_out.XXXXXX.txt)"
 FAIL_PERSIST="$FAIL_LOG"
 SKIP_PERSIST="$SKIP_LOG"
 MATCH_FILES_PERSIST="$MATCH_FILES_LOG"
+# Ensure per-run output is never stale (rg --json emits nothing on no matches).
+: >"$MATCH_FILES_PERSIST" 2>/dev/null || true
 
 cleanup() {
   [[ "${BASHPID:-$$}" -eq "$MAIN_BASHPID" ]] || return 0
@@ -551,6 +557,7 @@ ctx_lines = int(sys.argv[3])
 match_count_path = sys.argv[4]
 match_files_path = sys.argv[5] if len(sys.argv) > 5 else ""
 chat_mode = (len(sys.argv) > 6 and sys.argv[6] == "1")
+counts_only = (len(sys.argv) > 7 and sys.argv[7] == "1")
 
 RED        = "\x1b[31m"
 GREEN      = "\x1b[32m"
@@ -561,7 +568,8 @@ match_no = 0
 match_files = {}
 CHAT_PREFIX = "\x1eCHAT\t"
 preproc_path = sys.argv[7] if len(sys.argv) > 7 else ""
-skip_rg_path = sys.argv[8] if len(sys.argv) > 8 else ""
+preproc_path = sys.argv[8] if len(sys.argv) > 8 else ""
+skip_rg_path = sys.argv[9] if len(sys.argv) > 9 else ""
 skipped_rg = set()
 
 def byte_to_char_index(s: str, byte_idx: int) -> int:
@@ -931,7 +939,8 @@ for raw in sys.stdin:
       ts = ts_map.get(ln, "")
       ts_prefix = f"{ts} | " if ts else ""
       match_no += 1
-      print(f"{GREEN}{match_no}{RESET} {LIGHT_BLUE}{path} {ln}:{RESET} {ts_prefix}{snippet}")
+      if not counts_only:
+        print(f"{GREEN}{match_no}{RESET} {LIGHT_BLUE}{path} {ln}:{RESET} {ts_prefix}{snippet}")
 
     if matches:
       match_files[path] = len(matches)
@@ -2290,16 +2299,25 @@ RG_DOC=()
 
   echo "$warn_groups" >"$tmp_rc2"
   exit 0
-) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$tmp_chat" "$tmp_skip_rg"
+) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$COUNTS_ONLY" "$tmp_chat" "$tmp_skip_rg"
 
 end_ns="$(date +%s%N)"
 
-python3 - <<PY
+if [[ "$COUNTS_ONLY" -eq 1 ]]; then
+  python3 - <<PY 1>&2
 start = int("$start_ns")
 end = int("$end_ns")
 elapsed = max(0, end - start)
 print(f"Time taken: {elapsed / 1_000_000_000:.3f}s")
 PY
+else
+  python3 - <<PY
+start = int("$start_ns")
+end = int("$end_ns")
+elapsed = max(0, end - start)
+print(f"Time taken: {elapsed / 1_000_000_000:.3f}s")
+PY
+fi
 
 match_count=0
 [[ -s "$tmp_mc" ]] && match_count="$(cat "$tmp_mc" 2>/dev/null || echo 0)"
@@ -2528,6 +2546,13 @@ print("---- end per-extension scan summary ----\n")
 PY
 
   python3 "$tmp_vsum" "$tmp_stats_json" "$FAIL_PERSIST" "$tmp_skip_rg" 1>&2
+fi
+
+if [[ "$COUNTS_ONLY" -eq 1 ]]; then
+  # Machine-friendly: stdout is only the TSV counts.
+  [[ -s "$MATCH_FILES_PERSIST" ]] && cat "$MATCH_FILES_PERSIST"
+  [[ "$match_count" -gt 0 ]] && exit 0
+  exit 1
 fi
 
 if [[ "$match_count" -gt 0 ]]; then
