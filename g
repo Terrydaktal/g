@@ -342,6 +342,12 @@ FILTER_EXTS=(
   txt md rst log csv tsv json jsonl yaml yml toml ini conf cfg xml html htm css
   py sh bash zsh fish c h cpp hpp cc cxx java kt go rs js mjs cjs ts tsx jsx php rb pl
   pdf docx doc xlsx xls pptx ppt sqlite sqlite3 db db3
+  "(none)" "(dotfile)"
+  cmake mk mak properties lock
+  cs ps1 sql proto asm awk sed reg
+  inc inl hxx cuh cu
+  svg xsd xsl resx manifest
+  sln csproj
 )
 FD_EXCLUDE_PATTERNS=(
   "remote-server"
