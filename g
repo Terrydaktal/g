@@ -388,7 +388,7 @@ if [[ "$AUDIT" -eq 1 ]]; then
         fd "${FD_ARGS[@]}" . "$p" 2>/dev/null || true
       fi
     done
-  } | gawk -v RS='\0' -v MODE="$EXT_FILTER_MODE" -v WLIST="$FILTER_LIST" -v TOPN="300" '
+  } | gawk -v RS='\0' -v MODE="$EXT_FILTER_MODE" -v WLIST="$FILTER_LIST" -v TOPN="1000" '
 BEGIN {
   EXT_W = 10
   n = split(WLIST, wl_words, /[[:space:]]+/)
