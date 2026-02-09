@@ -348,6 +348,14 @@ FILTER_EXTS=(
   inc inl hxx cuh cu
   svg xsd xsl resx manifest
   sln csproj
+  spec src ver po config
+  pom vcproj vcxproj targets
+  diff patch
+  tpl tmpl template jinja
+  plist xhtml dtd wsdl
+  lua swift
+  glsl hlsl wgsl shader
+  ninja make map lst
 )
 FD_EXCLUDE_PATTERNS=(
   "remote-server"
