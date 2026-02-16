@@ -64,7 +64,7 @@ usage() {
   cat <<'EOF'
 Usage:
   g --audit [PATH...]
-  g [--hidden] [-l|--literal] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [--counts] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
+  g [--hidden] [-l|--literal] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [--counts] [-A N] [-B N] [-C N] [-v] PATTERN [PATH...]
 
 Modes:
   --audit        Fast audit: counts hidden vs non-hidden by extension (fd + gawk only)
@@ -90,9 +90,9 @@ Pattern:
   Example: '\bayman\b' matches the word ayman.
 
 Options:
-  -B N           chars before match (default 10)
-  -A N           chars after match  (default 10)
-  -C N           set both -B and -A to N
+  -A N           chars before match (default 10)
+  -B N           chars after match  (default 10)
+  -C N           set both -A and -B to N
   -v             verbose (end-of-run per-extension scan summary)
   --chat         search chat exports only (in chat mode -B/-A/-C are message counts)
   --chat-ts=VAL  keep (keep) or drop (drop) timestamps in chat output (default: keep)
@@ -218,8 +218,8 @@ for idx in "${!args[@]}"; do
             if [[ $((i + 1)) -lt ${#short} ]]; then
               next_val="${short:$((i + 1))}"
               case "$ch" in
-                B) BEFORE="$next_val" ;;
-                A) AFTER="$next_val" ;;
+                B) AFTER="$next_val" ;;
+                A) BEFORE="$next_val" ;;
                 C) BEFORE="$next_val"; AFTER="$next_val" ;;
               esac
               i=${#short}
@@ -233,8 +233,8 @@ for idx in "${!args[@]}"; do
               exit 2
             fi
             case "$ch" in
-              B) BEFORE="$next_val" ;;
-              A) AFTER="$next_val" ;;
+              B) AFTER="$next_val" ;;
+              A) BEFORE="$next_val" ;;
               C) BEFORE="$next_val"; AFTER="$next_val" ;;
             esac
             skip_next=1
@@ -256,8 +256,8 @@ set -- "${filtered[@]}"
 
 while getopts ":B:A:C:vhul-:" opt; do
   case "$opt" in
-    B) BEFORE="$OPTARG" ;;
-    A) AFTER="$OPTARG" ;;
+    B) AFTER="$OPTARG" ;;
+    A) BEFORE="$OPTARG" ;;
     C) BEFORE="$OPTARG"; AFTER="$OPTARG" ;;
     v) VERBOSE=1 ;;
     h) usage; exit 0 ;;
@@ -2038,7 +2038,7 @@ PY
 
 if [[ "$VERBOSE" -eq 1 ]]; then
   {
-    echo "window: -B $BEFORE -A $AFTER ; ctx_lines=$CTX_LINES"
+    echo "window: -A $BEFORE -B $AFTER ; ctx_lines=$CTX_LINES"
     echo "search flags: hidden=$SEARCH_HIDDEN uuu=$SEARCH_UUU binary=$SEARCH_BINARY no_ignore=$NO_IGNORE ucount=$UCOUNT case_sensitive=$CASE_SENSITIVE"
     echo "ext filter: mode=$EXT_FILTER_MODE"
     echo "have_rga_preproc=$HAVE_RGA_PREPROC have_xlsx2csv=$HAVE_XLSX2CSV have_pptx=$HAVE_PPTX have_doc=$HAVE_DOC"
