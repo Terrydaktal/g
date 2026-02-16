@@ -22,6 +22,7 @@ CASE_SENSITIVE=0
 COUNTS_ONLY=0
 A_GIVEN=0
 B_GIVEN=0
+BEFORE_TO_LINE_START=0
 
 EXT_FILTER_MODE="all"  # all|whitelist|blacklist
 
@@ -92,11 +93,13 @@ Pattern:
   Example: '\bayman\b' matches the word ayman.
 
 Options:
-  -B N           chars before match (default 10)
+  -B N|start     chars before match (default 10; use 'start' for line start)
   -A N           chars after match  (default 10)
   -C N           set both -B and -A to N
+                 if only -A is provided, -B defaults to 0
+                 if only -B is provided, -A defaults to 0
   -v             verbose (end-of-run per-extension scan summary)
-  --chat         search chat exports only (in chat mode -B/-A/-C are message counts)
+  --chat         search chat exports only (in chat mode -B/-A/-C are numeric message counts)
   --chat-ts=VAL  keep (keep) or drop (drop) timestamps in chat output (default: keep)
   --chat-prefilter    prefilter chat files with raw rg before parsing (default: on)
   --no-chat-prefilter disable chat prefilter
@@ -220,9 +223,18 @@ for idx in "${!args[@]}"; do
             if [[ $((i + 1)) -lt ${#short} ]]; then
               next_val="${short:$((i + 1))}"
               case "$ch" in
-                B) BEFORE="$next_val"; B_GIVEN=1 ;;
+                B)
+                  if [[ "${next_val,,}" == "start" ]]; then
+                    BEFORE=0
+                    BEFORE_TO_LINE_START=1
+                  else
+                    BEFORE="$next_val"
+                    BEFORE_TO_LINE_START=0
+                  fi
+                  B_GIVEN=1
+                  ;;
                 A) AFTER="$next_val"; A_GIVEN=1 ;;
-                C) BEFORE="$next_val"; AFTER="$next_val"; A_GIVEN=1; B_GIVEN=1 ;;
+                C) BEFORE="$next_val"; AFTER="$next_val"; A_GIVEN=1; B_GIVEN=1; BEFORE_TO_LINE_START=0 ;;
               esac
               i=${#short}
               continue
@@ -235,9 +247,18 @@ for idx in "${!args[@]}"; do
               exit 2
             fi
             case "$ch" in
-              B) BEFORE="$next_val"; B_GIVEN=1 ;;
+              B)
+                if [[ "${next_val,,}" == "start" ]]; then
+                  BEFORE=0
+                  BEFORE_TO_LINE_START=1
+                else
+                  BEFORE="$next_val"
+                  BEFORE_TO_LINE_START=0
+                fi
+                B_GIVEN=1
+                ;;
               A) AFTER="$next_val"; A_GIVEN=1 ;;
-              C) BEFORE="$next_val"; AFTER="$next_val"; A_GIVEN=1; B_GIVEN=1 ;;
+              C) BEFORE="$next_val"; AFTER="$next_val"; A_GIVEN=1; B_GIVEN=1; BEFORE_TO_LINE_START=0 ;;
             esac
             skip_next=1
             ;;
@@ -258,9 +279,18 @@ set -- "${filtered[@]}"
 
 while getopts ":B:A:C:vhul-:" opt; do
   case "$opt" in
-    B) BEFORE="$OPTARG"; B_GIVEN=1 ;;
+    B)
+      if [[ "${OPTARG,,}" == "start" ]]; then
+        BEFORE=0
+        BEFORE_TO_LINE_START=1
+      else
+        BEFORE="$OPTARG"
+        BEFORE_TO_LINE_START=0
+      fi
+      B_GIVEN=1
+      ;;
     A) AFTER="$OPTARG"; A_GIVEN=1 ;;
-    C) BEFORE="$OPTARG"; AFTER="$OPTARG"; A_GIVEN=1; B_GIVEN=1 ;;
+    C) BEFORE="$OPTARG"; AFTER="$OPTARG"; A_GIVEN=1; B_GIVEN=1; BEFORE_TO_LINE_START=0 ;;
     v) VERBOSE=1 ;;
     h) usage; exit 0 ;;
     u) UCOUNT=$((UCOUNT + 1)) ;;
@@ -313,6 +343,10 @@ if [[ "$A_GIVEN" -eq 1 && "$B_GIVEN" -eq 0 ]]; then
 fi
 if [[ "$B_GIVEN" -eq 1 && "$A_GIVEN" -eq 0 ]]; then
   AFTER=0
+fi
+if [[ "$CHAT_MODE" -eq 1 && "$BEFORE_TO_LINE_START" -eq 1 ]]; then
+  echo "Error: -B start is only supported outside --chat mode." >&2
+  exit 2
 fi
 
 # Apply -u/-uu/-uuu semantics
@@ -583,6 +617,7 @@ match_count_path = sys.argv[4]
 match_files_path = sys.argv[5] if len(sys.argv) > 5 else ""
 chat_mode = (len(sys.argv) > 6 and sys.argv[6] == "1")
 counts_only = (len(sys.argv) > 7 and sys.argv[7] == "1")
+before_to_line_start = (len(sys.argv) > 10 and sys.argv[10] == "1")
 
 RED        = "\x1b[31m"
 GREEN      = "\x1b[32m"
@@ -954,7 +989,10 @@ for raw in sys.stdin:
       m_start = base + s_char
       m_end   = base + e_char
 
-      lo = max(0, m_start - before)
+      if before_to_line_start:
+        lo = base
+      else:
+        lo = max(0, m_start - before)
       hi = min(len(combined), m_end + after)
       snippet_text = combined[lo:hi]
       rel_start = m_start - lo
@@ -2324,7 +2362,7 @@ RG_DOC=()
 
   echo "$warn_groups" >"$tmp_rc2"
   exit 0
-) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$COUNTS_ONLY" "$tmp_chat" "$tmp_skip_rg"
+) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$COUNTS_ONLY" "$tmp_chat" "$tmp_skip_rg" "$BEFORE_TO_LINE_START"
 
 end_ns="$(date +%s%N)"
 
