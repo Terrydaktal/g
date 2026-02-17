@@ -627,7 +627,6 @@ RESET      = "\x1b[0m"
 match_no = 0
 match_files = {}
 CHAT_PREFIX = "\x1eCHAT\t"
-preproc_path = sys.argv[7] if len(sys.argv) > 7 else ""
 preproc_path = sys.argv[8] if len(sys.argv) > 8 else ""
 skip_rg_path = sys.argv[9] if len(sys.argv) > 9 else ""
 skipped_rg = set()
@@ -942,22 +941,23 @@ for raw in sys.stdin:
         start_ln = ln - before
         end_ln = ln + after
         match_no += 1
-        print(f"{GREEN}{match_no}{RESET} {LIGHT_BLUE}{path} {ln}:{RESET}")
-        for n in all_line_nos:
-          if n < start_ln or n > end_ln:
-            continue
-          msg = lines_map.get(n, "")
-          spans = chat_spans.get(n)
-          if spans:
-            msg = highlight_spans(msg, spans)
-          sender = sender_map.get(n, "")
-          ts = ts_map.get(n, "")
-          print(f"{{{msg},{sender},{ts}}}")
-        max_ln = max(all_line_nos) if all_line_nos else 0
-        missing_after = max(0, end_ln - max_ln)
-        if missing_after:
-          for msg, sender, ts in read_next_chat_lines(path, missing_after):
+        if not counts_only:
+          print(f"{GREEN}{match_no}{RESET} {LIGHT_BLUE}{path} {ln}:{RESET}")
+          for n in all_line_nos:
+            if n < start_ln or n > end_ln:
+              continue
+            msg = lines_map.get(n, "")
+            spans = chat_spans.get(n)
+            if spans:
+              msg = highlight_spans(msg, spans)
+            sender = sender_map.get(n, "")
+            ts = ts_map.get(n, "")
             print(f"{{{msg},{sender},{ts}}}")
+          max_ln = max(all_line_nos) if all_line_nos else 0
+          missing_after = max(0, end_ln - max_ln)
+          if missing_after:
+            for msg, sender, ts in read_next_chat_lines(path, missing_after):
+              print(f"{{{msg},{sender},{ts}}}")
         continue
 
       local_nos = [n for n in all_line_nos if abs(n - ln) <= ctx_lines]
@@ -1556,6 +1556,313 @@ def parse_gemini_json(path: str) -> bool:
     emitted += 1
   return emitted > 0
 
+def _ts_from_epoch_seconds(ts):
+  try:
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+  except Exception:
+    return ""
+
+def _chatgpt_content_text(content) -> str:
+  if not isinstance(content, dict):
+    return ""
+  ctype = content.get("content_type") or ""
+  if ctype == "text":
+    parts = content.get("parts") or []
+    if isinstance(parts, list):
+      return " ".join(str(p) for p in parts if p)
+  # Many non-text types store their payload in "text".
+  txt = content.get("text")
+  if isinstance(txt, str) and txt.strip():
+    return txt
+  parts = content.get("parts")
+  if isinstance(parts, list):
+    return " ".join(str(p) for p in parts if p)
+  return ""
+
+def _emit_chatgpt_export(convs) -> bool:
+  # convs: list of conversations (ChatGPT export)
+  if not isinstance(convs, list) or not convs:
+    return False
+  emitted = 0
+  for conv in convs:
+    if not isinstance(conv, dict):
+      continue
+    mapping = conv.get("mapping")
+    if not isinstance(mapping, dict) or not mapping:
+      continue
+    # Find roots (parent == null). Most roots are structural and have message=null.
+    roots = []
+    for nid, node in mapping.items():
+      if isinstance(node, dict) and node.get("parent") is None:
+        roots.append(str(nid))
+    if not roots:
+      roots = [str(next(iter(mapping.keys())))]
+
+    # Iterative walk (avoid Python recursion depth limits on long threads).
+    seen = set()
+    stack = list(roots)
+    while stack:
+      nid = stack.pop()
+      if nid in seen:
+        continue
+      seen.add(nid)
+      node = mapping.get(nid)
+      if not isinstance(node, dict):
+        continue
+      msg = node.get("message")
+      if isinstance(msg, dict):
+        md = msg.get("metadata") or {}
+        if isinstance(md, dict) and md.get("is_visually_hidden_from_conversation"):
+          pass
+        else:
+          author = msg.get("author") or {}
+          role = ""
+          if isinstance(author, dict):
+            role = str(author.get("role") or "")
+          sender = role or (str(author) if author else "")
+          # Prefer message-level create_time; fall back to conversation create_time.
+          ts = _ts_from_epoch_seconds(msg.get("create_time")) or _ts_from_epoch_seconds(conv.get("create_time")) or ""
+          content = msg.get("content")
+          text = _chatgpt_content_text(content)
+          # Some exports/HTML embed HTML entities inside JSON strings.
+          text = html.unescape(text or "")
+          if text and text.strip():
+            emit_chat_line(ts, sender, norm_text(text))
+            emitted += 1
+      children = node.get("children") or []
+      if isinstance(children, list) and children:
+        # Preserve original ordering as much as possible.
+        for c in reversed(children):
+          stack.append(str(c))
+  return emitted > 0
+
+def parse_chatgpt_json(path: str) -> bool:
+  try:
+    obj = json.load(open(path, "r", encoding="utf-8"))
+  except Exception:
+    return False
+  # conversations.json: list[conversation]
+  if isinstance(obj, list):
+    return _emit_chatgpt_export(obj)
+  return False
+
+def parse_chatgpt_html(path: str) -> bool:
+  # ChatGPT Data Export chat.html embeds JS: "var jsonData = [...]"
+  try:
+    raw = open(path, "r", encoding="utf-8", errors="ignore").read()
+  except Exception:
+    return False
+  if "ChatGPT Data Export" not in raw and "var jsonData" not in raw:
+    return False
+  i = raw.find("var jsonData")
+  if i < 0:
+    return False
+
+  def _extract_json_array(s: str, start: int) -> str:
+    # Find the JSON array starting at/after `start`, using bracket matching.
+    k = s.find("[", start)
+    if k < 0:
+      return ""
+    depth = 0
+    in_str = False
+    esc = False
+    for idx in range(k, len(s)):
+      ch = s[idx]
+      if in_str:
+        if esc:
+          esc = False
+        elif ch == "\\":
+          esc = True
+        elif ch == "\"":
+          in_str = False
+        continue
+      if ch == "\"":
+        in_str = True
+        continue
+      if ch == "[":
+        depth += 1
+      elif ch == "]":
+        depth -= 1
+        if depth == 0:
+          return s[k:idx+1]
+    return ""
+
+  arr = _extract_json_array(raw, i)
+  if not arr:
+    return False
+  try:
+    convs = json.loads(arr)
+  except Exception:
+    return False
+  return _emit_chatgpt_export(convs)
+
+def parse_deepseek_json(path: str) -> bool:
+  try:
+    obj = json.load(open(path, "r", encoding="utf-8"))
+  except Exception:
+    return False
+  if not isinstance(obj, list) or not obj:
+    return False
+  emitted = 0
+  for conv in obj:
+    if not isinstance(conv, dict):
+      continue
+    mapping = conv.get("mapping")
+    if not isinstance(mapping, dict) or not mapping:
+      continue
+    root = mapping.get("root")
+    if not isinstance(root, dict):
+      # Some exports use numeric roots; fall back.
+      root = next((v for v in mapping.values() if isinstance(v, dict) and v.get("parent") is None), None)
+    if not isinstance(root, dict):
+      continue
+    stack = [str(x) for x in (root.get("children") or []) if x is not None]
+    seen = set()
+    while stack:
+      nid = stack.pop(0)
+      if nid in seen:
+        continue
+      seen.add(nid)
+      node = mapping.get(nid)
+      if not isinstance(node, dict):
+        continue
+      msg = node.get("message")
+      if isinstance(msg, dict):
+        ts = str(msg.get("inserted_at") or conv.get("inserted_at") or "")
+        frags = msg.get("fragments") or []
+        if isinstance(frags, list):
+          for frag in frags:
+            if not isinstance(frag, dict):
+              continue
+            ftyp = str(frag.get("type") or "")
+            txt = frag.get("content")
+            if not isinstance(txt, str) or not txt.strip():
+              continue
+            if ftyp.upper() == "REQUEST":
+              sender = "USER"
+            elif ftyp.upper() == "RESPONSE":
+              sender = "ASSISTANT"
+            elif ftyp.upper() == "THINK":
+              # Skip internal reasoning fragments by default.
+              continue
+            else:
+              sender = ftyp
+            emit_chat_line(ts, sender, norm_text(txt))
+            emitted += 1
+      children = node.get("children") or []
+      if isinstance(children, list):
+        for c in children:
+          if c is not None:
+            stack.append(str(c))
+  return emitted > 0
+
+def _mongo_date_to_iso(v) -> str:
+  # {"$date":{"$numberLong":"1760743150274"}} (ms since epoch)
+  try:
+    if isinstance(v, dict) and "$date" in v:
+      d = v.get("$date")
+      if isinstance(d, dict) and "$numberLong" in d:
+        return ts_from_ms(d.get("$numberLong"))
+      if isinstance(d, (int, float, str)):
+        return ts_from_ms(d)
+  except Exception:
+    pass
+  return ""
+
+def parse_grok_json(path: str) -> bool:
+  try:
+    obj = json.load(open(path, "r", encoding="utf-8"))
+  except Exception:
+    return False
+  if not isinstance(obj, dict):
+    return False
+  convs = obj.get("conversations")
+  if not isinstance(convs, list) or not convs:
+    return False
+  emitted = 0
+  for item in convs:
+    if not isinstance(item, dict):
+      continue
+    responses = item.get("responses") or []
+    if not isinstance(responses, list):
+      continue
+    for r in responses:
+      if not isinstance(r, dict):
+        continue
+      resp = r.get("response")
+      if not isinstance(resp, dict):
+        continue
+      msg = resp.get("message")
+      if not isinstance(msg, str) or not msg.strip():
+        continue
+      sender = str(resp.get("sender") or resp.get("model") or "")
+      ts = _mongo_date_to_iso(resp.get("create_time")) or str(resp.get("create_time") or "")
+      emit_chat_line(ts, sender, norm_text(msg))
+      emitted += 1
+  return emitted > 0
+
+class _HTMLText(HTMLParser):
+  def __init__(self):
+    super().__init__()
+    self.parts = []
+  def handle_data(self, data):
+    if data:
+      self.parts.append(data)
+  def get_text(self):
+    return "".join(self.parts)
+
+def _strip_html(s: str) -> str:
+  try:
+    p = _HTMLText()
+    p.feed(s or "")
+    p.close()
+    return p.get_text()
+  except Exception:
+    return re.sub(r"<[^>]+>", " ", s or "")
+
+def parse_google_gemini_myactivity_json(path: str) -> bool:
+  # Google Takeout "My Activity/Gemini Apps/MyActivity.json"
+  try:
+    obj = json.load(open(path, "r", encoding="utf-8"))
+  except Exception:
+    return False
+  if not isinstance(obj, list) or not obj:
+    return False
+  emitted = 0
+  for it in obj:
+    if not isinstance(it, dict):
+      continue
+    ts = str(it.get("time") or "")
+    title = str(it.get("title") or "")
+    prompt = title
+    if prompt.lower().startswith("prompted "):
+      prompt = prompt[len("prompted "):]
+    prompt = prompt.strip()
+    # Attached file hints (URLs point to sibling exported TXT files).
+    subs = it.get("subtitles") or []
+    attached = []
+    if isinstance(subs, list):
+      for s in subs:
+        if isinstance(s, dict) and s.get("url"):
+          attached.append(str(s.get("url")))
+    if prompt:
+      suffix = f" [attached: {', '.join(attached)}]" if attached else ""
+      emit_chat_line(ts, "USER", norm_text(prompt + suffix))
+      emitted += 1
+    safe = it.get("safeHtmlItem") or []
+    parts = []
+    if isinstance(safe, list):
+      for s in safe:
+        if isinstance(s, dict):
+          h = s.get("html")
+          if isinstance(h, str) and h.strip():
+            parts.append(_strip_html(html.unescape(h)))
+    resp = norm_text(" ".join(parts))
+    if resp:
+      emit_chat_line(ts, "GEMINI", resp)
+      emitted += 1
+  return emitted > 0
+
 def _codex_text_from_content(content):
   parts = []
   if isinstance(content, list):
@@ -1698,11 +2005,11 @@ def parse_telegram_sqlite(path: str) -> bool:
 def handlers_for_path(path: str):
   ext = os.path.splitext(path)[1].lower()
   if ext in (".html", ".htm"):
-    return (parse_telegram_html, parse_facebook_html)
+    return (parse_chatgpt_html, parse_telegram_html, parse_facebook_html)
   if ext in (".jsonl",):
     return (parse_codex_jsonl,)
   if ext in (".json",):
-    return (parse_gemini_json, parse_json_any)
+    return (parse_chatgpt_json, parse_deepseek_json, parse_grok_json, parse_google_gemini_myactivity_json, parse_gemini_json, parse_json_any)
   if ext in (".txt",):
     return (parse_telegram_txt, parse_whatsapp_txt, parse_json_any)
   if ext in (".sqlite", ".sqlite3", ".db"):
@@ -1893,6 +2200,75 @@ def looks_like_generic_chat_json(obj) -> bool:
 def looks_like_gemini_json(obj) -> bool:
   return isinstance(obj, dict) and isinstance(obj.get("messages"), list) and ("sessionId" in obj or "projectHash" in obj)
 
+def looks_like_chatgpt_export(obj) -> bool:
+  # ChatGPT "conversations.json" export: list of conversations w/ "mapping".
+  if not isinstance(obj, list) or not obj:
+    return False
+  first = obj[0]
+  if not (isinstance(first, dict) and isinstance(first.get("mapping"), dict)):
+    return False
+  # Heuristic: some combination of these fields tends to exist.
+  if "title" in first and ("create_time" in first or "update_time" in first):
+    return True
+  # Some exports nest under "conversation_id" etc; still treat mapping-driven list as ChatGPT-like.
+  return True
+
+def looks_like_deepseek_export(obj) -> bool:
+  # DeepSeek export: list of conversations with mapping nodes containing message.fragments.
+  if not isinstance(obj, list) or not obj:
+    return False
+  first = obj[0]
+  if not (isinstance(first, dict) and isinstance(first.get("mapping"), dict)):
+    return False
+  m = first.get("mapping") or {}
+  # Root node is often "root" and child nodes have message.fragments with REQUEST/RESPONSE.
+  for k in ("root", "1", 1):
+    node = m.get(k)
+    if isinstance(node, dict):
+      msg = node.get("message")
+      if isinstance(msg, dict) and isinstance(msg.get("fragments"), list):
+        return True
+  # Scan a few nodes for fragments
+  for node in list(m.values())[:10]:
+    if isinstance(node, dict):
+      msg = node.get("message")
+      if isinstance(msg, dict) and isinstance(msg.get("fragments"), list):
+        return True
+  return False
+
+def looks_like_grok_export(obj) -> bool:
+  # Grok export: {"conversations":[{"conversation":{...},"responses":[{"response":{...}}]}]}
+  if not isinstance(obj, dict):
+    return False
+  convs = obj.get("conversations")
+  if not isinstance(convs, list) or not convs:
+    return False
+  first = convs[0]
+  if not isinstance(first, dict):
+    return False
+  if isinstance(first.get("conversation"), dict) and isinstance(first.get("responses"), list):
+    return True
+  return False
+
+def looks_like_google_gemini_myactivity(obj) -> bool:
+  # Google Takeout "My Activity/Gemini Apps/MyActivity.json"
+  if not isinstance(obj, list) or not obj:
+    return False
+  first = obj[0]
+  if not isinstance(first, dict):
+    return False
+  if ("safeHtmlItem" in first or "safeHtmlItem".lower() in (k.lower() for k in first.keys())) and ("time" in first or "title" in first):
+    # Further refine to Gemini Apps header/product when present.
+    hdr = str(first.get("header") or "")
+    prods = first.get("products") or []
+    if "gemini" in hdr.lower():
+      return True
+    if any("gemini" in str(p).lower() for p in prods if p):
+      return True
+    # Some takeouts omit header/products; safeHtmlItem+title+time is strong enough.
+    return True
+  return False
+
 def looks_like_codex_jsonl(s: bytes, p_low: str) -> bool:
   if b'"type":"response_item"' in s or b'"type":"event_msg"' in s:
     if b'"payload"' in s and b'"timestamp"' in s:
@@ -1917,6 +2293,8 @@ def should_route_chat(path: str, ext: str, lazy_sniff):
     if "telegram" in p_low or "facebook" in p_low or "messenger" in p_low:
       return "chat"
     t = lazy_sniff().lower()
+    if b"chatgpt data export" in t and b"var jsondata" in t:
+      return "aichat"
     if b"message" in t:
       return "chat"
     return False
@@ -1926,20 +2304,48 @@ def should_route_chat(path: str, ext: str, lazy_sniff):
       import json as _json
       data = lazy_sniff()
       t = data.lower()
-      if b'"messages"' not in t and b'"message"' not in t and b'"text"' not in t and b'"content"' not in t:
+      # Fast-path: require *some* chat/LLM-ish structure before parsing.
+      if (
+        b'"messages"' not in t and b'"message"' not in t and b'"text"' not in t and b'"content"' not in t and
+        b'"mapping"' not in t and b'"fragments"' not in t and b'"conversations"' not in t and b'"safehtmlitem"' not in t
+      ):
         return False
-      if not (base.startswith(("message", "messages", "result")) or "messages" in p_low or "telegram" in p_low or "facebook" in p_low or "messenger" in p_low or "chat" in p_low or "whatsapp" in p_low):
-        if b'"sender"' not in t and b'"sender_name"' not in t and b'"from"' not in t and b'"actor"' not in t and b'"timestamp"' not in t and b'"date"' not in t:
+      if not (
+        base.startswith(("message", "messages", "result", "conversation", "conversations")) or
+        "messages" in p_low or "telegram" in p_low or "facebook" in p_low or "messenger" in p_low or
+        "chat" in p_low or "whatsapp" in p_low or "chatgpt" in p_low or "deepseek" in p_low or "grok" in p_low or "gemini" in p_low
+      ):
+        if (
+          b'"sender"' not in t and b'"sender_name"' not in t and b'"from"' not in t and b'"actor"' not in t and
+          b'"timestamp"' not in t and b'"date"' not in t and b'"mapping"' not in t and b'"fragments"' not in t and b'"conversations"' not in t
+        ):
           return False
 
+      # Heuristics that work on prefix sniffs (large exports won't fit in SNIFF_LIMIT).
       if b'"messages"' in t and (b'"sessionid"' in t or b'"projecthash"' in t):
         return "aichat"
-
-      obj = _json.loads(data.decode("utf-8", "ignore"))
-      if looks_like_gemini_json(obj):
+      # ChatGPT export: list of convs w/ mapping/author/create_time.
+      if b'"mapping"' in t and b'"author"' in t and (b'"create_time"' in t or b'"update_time"' in t):
         return "aichat"
-      if looks_like_telegram_json(obj) or looks_like_messenger_json(obj) or looks_like_generic_chat_json(obj):
-        return "chat"
+      # DeepSeek export: mapping + fragments REQUEST/RESPONSE.
+      if b'"fragments"' in t and b'"inserted_at"' in t and (b'"request"' in t or b'"response"' in t):
+        return "aichat"
+      # Grok export: conversations + responses (+ response/conversation metadata).
+      # Some exports don't include "sender" early in the file, so don't require it here.
+      if b'"conversations"' in t and b'"responses"' in t and (b'"response"' in t or b'"conversation"' in t or b'"create_time"' in t):
+        return "aichat"
+      # Google Takeout Gemini Apps activity.
+      if b'"safehtmlitem"' in t and b'"title"' in t and (b'"gemini apps"' in t or b'"prompted' in t):
+        return "aichat"
+
+      # If the JSON fits entirely in the sniff buffer, parse it to detect chat apps.
+      tail = t.strip()
+      if len(data) < SNIFF_LIMIT and (tail.endswith(b"}") or tail.endswith(b"]")):
+        obj = _json.loads(data.decode("utf-8", "ignore"))
+        if looks_like_gemini_json(obj) or looks_like_chatgpt_export(obj) or looks_like_deepseek_export(obj) or looks_like_grok_export(obj) or looks_like_google_gemini_myactivity(obj):
+          return "aichat"
+        if looks_like_telegram_json(obj) or looks_like_messenger_json(obj) or looks_like_generic_chat_json(obj):
+          return "chat"
     except Exception:
       pass
     return False
