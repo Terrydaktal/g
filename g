@@ -7,6 +7,7 @@ BEFORE=10
 AFTER=10
 VERBOSE=0
 AUDIT=0
+AUDIT_SIZES=0
 CHAT_MODE=0
 CHAT_KEEP_TS=1
 CHAT_PREFILTER="${G_CHAT_PREFILTER:-1}"
@@ -66,11 +67,12 @@ BATCH_DOC="${G_BATCH_DOC:-16}"
 usage() {
   cat <<'EOF'
 Usage:
-  g --audit [PATH...]
+  g --audit [--sizes] [PATH...]
   g [--hidden] [-l|--literal] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [--counts] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
 
 Modes:
   --audit        Fast audit: counts hidden vs non-hidden by extension (fd + gawk only)
+  --sizes        (audit-only) include apparent-size byte totals per extension (uses du; no content reads)
   search         Searches for PATTERN and prints token-windowed matches.
 
 Search flags:
@@ -171,6 +173,7 @@ for idx in "${!args[@]}"; do
       break
       ;;
     --audit) AUDIT=1; continue ;;
+    --sizes) AUDIT_SIZES=1; continue ;;
     --help) usage; exit 0 ;;
     --hidden) SEARCH_HIDDEN=1; continue ;;
     --binary|--text) SEARCH_BINARY=1; continue ;;
@@ -299,6 +302,7 @@ while getopts ":B:A:C:vhul-:" opt; do
       case "${OPTARG}" in
         help) usage; exit 0 ;;
         audit) AUDIT=1 ;;
+        sizes) AUDIT_SIZES=1 ;;
         hidden) SEARCH_HIDDEN=1 ;;
         literal) FIXED_STRINGS=1 ;;
         binary|text) SEARCH_BINARY=1 ;;
@@ -413,6 +417,7 @@ CTX_LINES=$((BEFORE + AFTER + 20))
 # -----------------------------
 if [[ "$AUDIT" -eq 1 ]]; then
   need_cmd gawk
+  [[ "$AUDIT_SIZES" -eq 0 ]] || need_cmd du
 
   PATHS=("$@")
   if [[ ${#PATHS[@]} -ge 2 ]]; then
@@ -441,7 +446,15 @@ if [[ "$AUDIT" -eq 1 ]]; then
         fd "${FD_ARGS[@]}" . "$p" 2>/dev/null || true
       fi
     done
-  } | gawk -v RS='\0' -v MODE="$EXT_FILTER_MODE" -v WLIST="$FILTER_LIST" -v TOPN="1000" '
+  } | {
+    if [[ "$AUDIT_SIZES" -eq 1 ]]; then
+      # Convert NUL-separated file list to NUL-separated "bytes<TAB>path" lines.
+      # --apparent-size uses logical file size (st_size), not blocks used.
+      du --files0-from=- --null --apparent-size --block-size=1 -0 2>/dev/null || true
+    else
+      cat
+    fi
+  } | gawk -v RS='\0' -v FS='\t' -v MODE="$EXT_FILTER_MODE" -v WLIST="$FILTER_LIST" -v TOPN="1000" -v SIZES="$AUDIT_SIZES" '
 BEGIN {
   EXT_W = 10
   n = split(WLIST, wl_words, /[[:space:]]+/)
@@ -472,21 +485,37 @@ function allowed_for_table(ext) {
 function wl_yes(e) { return (e in wl) ? "yes" : "" }
 function bucket_of(e) { return (e in bucket) ? bucket[e] : "text" }
 
-function cmp(i1, v1, i2, v2,    t1,t2,n1,n2,h1,h2) {
+function bytes_total(e) { return (b_non[e] + b_hid[e]) + 0 }
+
+function cmp(i1, v1, i2, v2,    t1,t2,n1,n2,h1,h2,b1,b2) {
   t1 = (non[i1] + hid[i1]) + 0; t2 = (non[i2] + hid[i2]) + 0
+  if (SIZES + 0) {
+    b1 = bytes_total(i1); b2 = bytes_total(i2)
+    if (b1 != b2) return (b2 > b1) ? 1 : -1
+  }
   if (t1 != t2) return (t2 - t1)
   n1 = non[i1] + 0; n2 = non[i2] + 0; if (n1 != n2) return (n2 - n1)
   h1 = hid[i1] + 0; h2 = hid[i2] + 0; if (h1 != h2) return (h2 - h1)
   return (i1 < i2 ? -1 : (i1 > i2 ? 1 : 0))
 }
 {
-  p = $0; if (p == "") next
+  rec = $0; if (rec == "") next
+  sz = 0
+  p = rec
+  if (SIZES + 0) {
+    # rec is "bytes<TAB>path" (from du). Strip the first field to recover full path.
+    sz = $1 + 0
+    sub(/^[0-9]+\t/, "", p)
+  }
   e = ext_of(p); hidden = is_hidden_path(p)
 
   if (hidden) { if (e in wl) wl_hid++; else bl_hid++; } else { if (e in wl) wl_non++; else bl_non++; }
 
   if (!allowed_for_table(e)) next
   if (hidden) hid[e]++; else non[e]++
+  if (SIZES + 0) {
+    if (hidden) b_hid[e] += sz; else b_non[e] += sz
+  }
   seen[e] = 1
 }
 END {
@@ -498,19 +527,36 @@ END {
   printf "blacklist_hidden:     %d\n", bl_hid+0
   printf "total:               %d\n\n", total+0
 
-  printf "%-*s %-5s %-6s %12s %12s %12s\n", EXT_W, "ext", "wlist", "bucket", "non_hidden", "hidden", "total"
+  if (SIZES + 0) {
+    printf "%-*s %-5s %-6s %12s %12s %12s %14s\n", EXT_W, "ext", "wlist", "bucket", "non_hidden", "hidden", "total", "bytes_total"
+  } else {
+    printf "%-*s %-5s %-6s %12s %12s %12s\n", EXT_W, "ext", "wlist", "bucket", "non_hidden", "hidden", "total"
+  }
 
   nkeys = asorti(seen, ord, "cmp")
   other_non = other_hid = 0
+  other_b_non = other_b_hid = 0
   for (i=1; i<=nkeys; i++) {
     e = ord[i]
     nh = non[e] + 0; hh = hid[e] + 0; tot = nh + hh
     if (i <= TOPN) {
-      printf "%-*s %-5s %-6s %12d %12d %12d\n", EXT_W, e, wl_yes(e), bucket_of(e), nh, hh, tot
-    } else { other_non += nh; other_hid += hh }
+      if (SIZES + 0) {
+        bt = bytes_total(e)
+        printf "%-*s %-5s %-6s %12d %12d %12d %14.0f\n", EXT_W, e, wl_yes(e), bucket_of(e), nh, hh, tot, bt
+      } else {
+        printf "%-*s %-5s %-6s %12d %12d %12d\n", EXT_W, e, wl_yes(e), bucket_of(e), nh, hh, tot
+      }
+    } else {
+      other_non += nh; other_hid += hh
+      if (SIZES + 0) { other_b_non += b_non[e] + 0; other_b_hid += b_hid[e] + 0 }
+    }
   }
   if (nkeys > TOPN) {
-    printf "%-*s %-5s %-6s %12d %12d %12d\n", EXT_W, "other", "", "", other_non+0, other_hid+0, (other_non+other_hid)
+    if (SIZES + 0) {
+      printf "%-*s %-5s %-6s %12d %12d %12d %14.0f\n", EXT_W, "other", "", "", other_non+0, other_hid+0, (other_non+other_hid), (other_b_non+other_b_hid)
+    } else {
+      printf "%-*s %-5s %-6s %12d %12d %12d\n", EXT_W, "other", "", "", other_non+0, other_hid+0, (other_non+other_hid)
+    }
   }
   print "---- end audit ----"
 }'
