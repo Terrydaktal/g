@@ -19,6 +19,7 @@ ALLOW_BROKEN_PIPE=0
 NOCHAT=0
 
 QUERY_CACHE_DIR="/tmp/g_chat_query_cache"
+QUERY_CACHE_KEEP="${G_CHAT_QUERY_CACHE_KEEP:-10}"
 
 SEARCH_HIDDEN=0
 SEARCH_UUU=0
@@ -123,6 +124,35 @@ EOF
 }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Error: '$1' not found in PATH." >&2; exit 127; }; }
+
+prune_query_cache() {
+  local dir="$1"
+  local keep="${2:-10}"
+  [[ -d "$dir" ]] || return 0
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep=10
+
+  # Remove partial/orphaned cache shards (best effort).
+  local f key
+  for f in "$dir"/*.dat; do
+    [[ -e "$f" ]] || continue
+    key="$(basename "$f" .dat)"
+    if [[ ! -e "$dir/$key.meta.json" ]]; then
+      rm -f "$dir/$key.dat" "$dir/$key.idx" 2>/dev/null || true
+    fi
+  done
+
+  local -a metas=()
+  mapfile -t metas < <(ls -1t "$dir"/*.meta.json 2>/dev/null || true)
+  local n="${#metas[@]}"
+  (( n <= keep )) && return 0
+
+  local i meta
+  for ((i=keep; i<n; i++)); do
+    meta="${metas[$i]}"
+    key="$(basename "$meta" .meta.json)"
+    rm -f "$dir/$key.dat" "$dir/$key.idx" "$dir/$key.meta.json" 2>/dev/null || true
+  done
+}
 
 # ------------------------------------------------------------
 # Dependency bootstrap (Codex Web environments may not preinstall fd/ripgrep)
@@ -661,7 +691,7 @@ PATHS=("$@")
 QUERY_CACHE_DAT=""
 QUERY_CACHE_IDX=""
 QUERY_CACHE_META=""
-if [[ "$PAGE" != "0" ]]; then
+ if [[ "$PAGE" != "0" ]]; then
   mkdir -p "$QUERY_CACHE_DIR" 2>/dev/null || true
 
   QUERY_KEY="$(
@@ -692,6 +722,10 @@ PY
   QUERY_CACHE_META="$QUERY_CACHE_DIR/$QUERY_KEY.meta.json"
 
   if [[ -s "$QUERY_CACHE_DAT" && -s "$QUERY_CACHE_IDX" ]]; then
+    # Update recency for LRU pruning.
+    touch -c "$QUERY_CACHE_META" 2>/dev/null || true
+    prune_query_cache "$QUERY_CACHE_DIR" "$QUERY_CACHE_KEEP"
+
     start_ns="$(date +%s%N)"
     python3 - "$QUERY_CACHE_DAT" "$QUERY_CACHE_IDX" "$PAGE" "$PAGE_SIZE" <<'PY'
 import struct, sys
@@ -3351,6 +3385,10 @@ end = int("$end_ns")
 elapsed = max(0, end - start)
 print(f"Time taken: {elapsed / 1_000_000_000:.3f}s")
 PY
+fi
+
+if [[ "$PAGE" != "0" ]]; then
+  prune_query_cache "$QUERY_CACHE_DIR" "$QUERY_CACHE_KEEP"
 fi
 
 match_count=0
