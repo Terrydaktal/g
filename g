@@ -426,7 +426,14 @@ FD_EXCLUDE_PATTERNS=(
   "remote-server"
 )
 
-CTX_LINES=$((BEFORE + AFTER + 20))
+# rg context lines:
+# - non-chat mode uses extra slack so snippet extraction can span multiple lines.
+# - chat mode should be tight, otherwise every match carries huge context payload.
+if [[ "$CHAT_MODE" -eq 1 ]]; then
+  CTX_LINES=$(( BEFORE > AFTER ? BEFORE : AFTER ))
+else
+  CTX_LINES=$((BEFORE + AFTER + 20))
+fi
 
 # -----------------------------
 # FAST AUDIT MODE
