@@ -13,6 +13,9 @@ CHAT_KEEP_TS=1
 CHAT_PREFILTER="${G_CHAT_PREFILTER:-1}"
 CHAT_CACHE_DIR=""
 CHAT_LINES_ONLY=0
+PAGE=0
+PAGE_SIZE=10
+ALLOW_BROKEN_PIPE=0
 NOCHAT=0
 
 SEARCH_HIDDEN=0
@@ -70,7 +73,7 @@ usage() {
   cat <<'EOF'
 Usage:
   g --audit [--sizes] [PATH...]
-  g [--hidden] [-l|--literal] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [--counts] [--chat-cache[=DIR]] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
+  g [--hidden] [-l|--literal] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [--counts] [--chat-cache[=DIR]] [--page N] [--page-size N] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
 
 Modes:
   --audit        Fast audit: counts hidden vs non-hidden by extension (fd + gawk only)
@@ -106,6 +109,8 @@ Options:
   --chat         search chat exports only (in chat mode -B/-A/-C are numeric message counts)
   --chat-cache[=DIR]  cache parsed chat text for repeated --chat searches (default: /tmp/g_chat_cache)
   --chat-lines   (chat-only) print each matching message once (no chat context; overrides -B/-A/-C)
+  --page N       (chat-only, requires --chat-lines) show only page N (default page-size 10); stops search early
+  --page-size N  (chat-only) page size for --page (default 10)
   --chat-ts=VAL  keep (keep) or drop (drop) timestamps in chat output (default: keep)
   --chat-prefilter    prefilter chat files with raw rg before parsing (default: on)
   --no-chat-prefilter disable chat prefilter
@@ -170,8 +175,8 @@ for idx in "${!args[@]}"; do
     continue
   fi
 
-  arg="${args[$idx]}"
-  case "$arg" in
+	arg="${args[$idx]}"
+	case "$arg" in
     --)
       filtered+=("${args[@]:$idx}")
       break
@@ -192,15 +197,29 @@ for idx in "${!args[@]}"; do
     --chat-prefilter) CHAT_PREFILTER=1; continue ;;
     --no-chat-prefilter) CHAT_PREFILTER=0; continue ;;
     --chat-cache) CHAT_CACHE_DIR="/tmp/g_chat_cache"; continue ;;
-    --chat-cache=*)
-      CHAT_CACHE_DIR="${arg#*=}"
-      [[ -z "$CHAT_CACHE_DIR" ]] && CHAT_CACHE_DIR="/tmp/g_chat_cache"
-      continue ;;
-    --chat-lines) CHAT_LINES_ONLY=1; continue ;;
-    --chat-prefilter=*)
-      val="${arg#*=}"
-      case "$val" in
-        1|true|yes|on) CHAT_PREFILTER=1 ;;
+	    --chat-cache=*)
+	      CHAT_CACHE_DIR="${arg#*=}"
+	      [[ -z "$CHAT_CACHE_DIR" ]] && CHAT_CACHE_DIR="/tmp/g_chat_cache"
+	      continue ;;
+	    --chat-lines) CHAT_LINES_ONLY=1; continue ;;
+	    --page)
+	      PAGE="${args[$((idx + 1))]:-}"
+	      skip_next=1
+	      continue ;;
+	    --page=*)
+	      PAGE="${arg#*=}"
+	      continue ;;
+	    --page-size)
+	      PAGE_SIZE="${args[$((idx + 1))]:-}"
+	      skip_next=1
+	      continue ;;
+	    --page-size=*)
+	      PAGE_SIZE="${arg#*=}"
+	      continue ;;
+	    --chat-prefilter=*)
+	      val="${arg#*=}"
+	      case "$val" in
+	        1|true|yes|on) CHAT_PREFILTER=1 ;;
         0|false|no|off) CHAT_PREFILTER=0 ;;
         *) echo "Error: unknown value for --chat-prefilter (use on|off)" >&2; exit 2 ;;
       esac
@@ -308,8 +327,8 @@ while getopts ":B:A:C:vhul-:" opt; do
     h) usage; exit 0 ;;
     u) UCOUNT=$((UCOUNT + 1)) ;;
     l) FIXED_STRINGS=1 ;;
-	    -)
-	      case "${OPTARG}" in
+		    -)
+		      case "${OPTARG}" in
         help) usage; exit 0 ;;
         audit) AUDIT=1 ;;
         sizes) AUDIT_SIZES=1 ;;
@@ -330,10 +349,10 @@ while getopts ":B:A:C:vhul-:" opt; do
 	          CHAT_CACHE_DIR="${OPTARG#*=}"
 	          [[ -z "$CHAT_CACHE_DIR" ]] && CHAT_CACHE_DIR="/tmp/g_chat_cache"
 	          ;;
-	        chat-lines) CHAT_LINES_ONLY=1 ;;
-	        chat-prefilter=*)
-	          val="${OPTARG#*=}"
-	          case "$val" in
+		        chat-lines) CHAT_LINES_ONLY=1 ;;
+		        chat-prefilter=*)
+		          val="${OPTARG#*=}"
+		          case "$val" in
 	            1|true|yes|on) CHAT_PREFILTER=1 ;;
             0|false|no|off) CHAT_PREFILTER=0 ;;
             *) echo "Error: unknown value for --chat-prefilter (use on|off)" >&2; usage; exit 2 ;;
@@ -367,6 +386,26 @@ fi
 if [[ "$CHAT_MODE" -eq 1 && "$BEFORE_TO_LINE_START" -eq 1 ]]; then
   echo "Error: -B start is only supported outside --chat mode." >&2
   exit 2
+fi
+
+if [[ "$PAGE" != "0" ]]; then
+  if [[ "$CHAT_MODE" -ne 1 || "$CHAT_LINES_ONLY" -ne 1 ]]; then
+    echo "Error: --page requires --chat --chat-lines" >&2
+    exit 2
+  fi
+  if [[ "$COUNTS_ONLY" -eq 1 ]]; then
+    echo "Error: --page is not compatible with --counts" >&2
+    exit 2
+  fi
+  if ! [[ "$PAGE" =~ ^[0-9]+$ ]] || [[ "$PAGE" -lt 1 ]]; then
+    echo "Error: --page must be an integer >= 1" >&2
+    exit 2
+  fi
+  if ! [[ "$PAGE_SIZE" =~ ^[0-9]+$ ]] || [[ "$PAGE_SIZE" -lt 1 ]]; then
+    echo "Error: --page-size must be an integer >= 1" >&2
+    exit 2
+  fi
+  ALLOW_BROKEN_PIPE=1
 fi
 
 # Apply -u/-uu/-uuu semantics
@@ -699,6 +738,13 @@ chat_mode = (len(sys.argv) > 6 and sys.argv[6] == "1")
 counts_only = (len(sys.argv) > 7 and sys.argv[7] == "1")
 before_to_line_start = (len(sys.argv) > 10 and sys.argv[10] == "1")
 chat_lines_only = (len(sys.argv) > 11 and sys.argv[11] == "1")
+page = int(sys.argv[12]) if len(sys.argv) > 12 else 0
+page_size = int(sys.argv[13]) if len(sys.argv) > 13 else 10
+
+page_enabled = (page > 0)
+page_size = max(1, int(page_size))
+page_start = ((page - 1) * page_size + 1) if page_enabled else 1
+page_end = (page * page_size) if page_enabled else 0
 
 RED        = "\x1b[31m"
 GREEN      = "\x1b[32m"
@@ -711,6 +757,37 @@ CHAT_PREFIX = "\x1eCHAT\t"
 preproc_path = sys.argv[8] if len(sys.argv) > 8 else ""
 skip_rg_path = sys.argv[9] if len(sys.argv) > 9 else ""
 skipped_rg = set()
+
+printed_chat_line_keys = set()
+
+def _write_outputs():
+  if skip_rg_path:
+    try:
+      with open(skip_rg_path, "w", encoding="utf-8", errors="replace") as f:
+        for p in sorted(skipped_rg):
+          f.write(f"skip-rg(binary): {p}\n")
+    except Exception:
+      pass
+
+  if match_files_path:
+    try:
+      items = [(cnt, path) for path, cnt in match_files.items() if cnt > 0]
+      items.sort(key=lambda x: (-x[0], x[1]))
+      with open(match_files_path, "w", encoding="utf-8", errors="replace") as f:
+        for cnt, path in items:
+          f.write(f"{cnt}\t{path}\n")
+    except Exception:
+      pass
+
+  try:
+    with open(match_count_path, "w", encoding="utf-8") as f:
+      f.write(str(match_no))
+  except Exception:
+    pass
+
+def _finish_and_exit():
+  _write_outputs()
+  raise SystemExit(0)
 
 def byte_to_char_index(s: str, byte_idx: int) -> int:
   if byte_idx <= 0:
@@ -939,9 +1016,62 @@ for raw in sys.stdin:
   path = get_path(obj)
   if not path:
     continue
+  data = obj.get("data", {})
 
   if typ == "binary":
     skipped_rg.add(path)
+    continue
+
+  # Fast path: in --chat --chat-lines mode, print each matching message line as it arrives.
+  # This avoids per-file buffering and improves time-to-first-result, and enables early exit for --page.
+  if typ == "match" and chat_mode and chat_lines_only:
+    line_no = data.get("line_number")
+    text = data.get("lines", {}).get("text", "")
+    if line_no is None:
+      continue
+
+    ln = int(line_no)
+    raw_text = text.rstrip("\n").replace("\r", "")
+    msg, ts, sender, prefix_b, is_chat = split_chat_line(raw_text)
+    if not is_chat:
+      continue
+
+    # Track total match counts per file (submatches), consistent with non-streaming mode.
+    try:
+      match_files[path] = match_files.get(path, 0) + len(data.get("submatches", []))
+    except Exception:
+      pass
+
+    key = (path, ln)
+    if key in printed_chat_line_keys:
+      continue
+    printed_chat_line_keys.add(key)
+
+    match_no += 1
+    if page_enabled and match_no < page_start:
+      continue
+
+    if not counts_only:
+      spans = []
+      for sub in data.get("submatches", []):
+        try:
+          sb = int(sub.get("start", 0)) - int(prefix_b or 0)
+          eb = int(sub.get("end", 0)) - int(prefix_b or 0)
+        except Exception:
+          continue
+        if eb <= 0:
+          continue
+        if sb < 0:
+          sb = 0
+        if sb == eb:
+          continue
+        spans.append((sb, eb))
+      out_msg = highlight_spans(msg, spans) if spans else msg
+      ts_prefix = f"{ts} | " if ts else ""
+      print(f"{GREEN}{match_no}{RESET} {LIGHT_BLUE}{path} {ln}:{RESET} {ts_prefix}{sender}: {out_msg}")
+
+    if page_enabled and match_no >= page_end:
+      _finish_and_exit()
     continue
 
   if typ == "begin":
@@ -950,8 +1080,6 @@ for raw in sys.stdin:
 
   if path not in files:
     files[path] = {"lines": {}, "matches": [], "ts": {}, "senders": {}, "prefix_b": {}, "chat_lines": set()}
-
-  data = obj.get("data", {})
 
   if typ in ("match", "context"):
     line_no = data.get("line_number")
@@ -1107,29 +1235,7 @@ for raw in sys.stdin:
       match_files[path] = len(matches)
     files.pop(path, None)
 
-if skip_rg_path:
-  try:
-    with open(skip_rg_path, "w", encoding="utf-8", errors="replace") as f:
-      for p in sorted(skipped_rg):
-        f.write(f"skip-rg(binary): {p}\n")
-  except Exception:
-    pass
-
-if match_files_path:
-  try:
-    items = [(cnt, path) for path, cnt in match_files.items() if cnt > 0]
-    items.sort(key=lambda x: (-x[0], x[1]))
-    with open(match_files_path, "w", encoding="utf-8", errors="replace") as f:
-      for cnt, path in items:
-        f.write(f"{cnt}\t{path}\n")
-  except Exception:
-    pass
-
-try:
-  with open(match_count_path, "w", encoding="utf-8") as f:
-    f.write(str(match_no))
-except Exception:
-  pass
+_write_outputs()
 PY
 
 # XLSX extractor: prints traceback and returns nonzero on failure
@@ -2806,44 +2912,62 @@ run_rg_json_parallel() {
     local out="$gdir/out_${i}.jsonl"
     : >"$out"
 
-    (
-      xargs -0 -a "$shard" -r -n "$batch" -- bash -c "
-        ${cmd_q} \"\$@\"
-        ec=\$?
-        if [ \"\$ec\" -eq 1 ]; then exit 0; fi
-        exit \"\$ec\"
-      " bash 1>>"$out" 2>>"$errfile"
-    ) &
+	    (
+	      xargs -0 -a "$shard" -r -n "$batch" -- bash -c "
+	        ${cmd_q} \"\$@\"
+	        ec=\$?
+	        if [ \"\$ec\" -eq 1 ] || { [ ${ALLOW_BROKEN_PIPE} -eq 1 ] && [ \"\$ec\" -eq 141 ]; }; then exit 0; fi
+	        exit \"\$ec\"
+	      " bash 1>>"$out" 2>>"$errfile"
+	    ) &
 
     local pid="$!"
     pids+=("$pid")
     out_by_pid["$pid"]="$out"
   done
 
-  local any_err=0
-  if [[ "$RUNNER_HAS_WAIT_NP" -eq 1 ]]; then
-    local -a active=("${pids[@]}")
-    local donepid=""
-    while [[ "${#active[@]}" -gt 0 ]]; do
-      if wait -n -p donepid "${active[@]}"; then :; else any_err=1; fi
-      local out="${out_by_pid[$donepid]:-}"
-      if [[ -n "$out" && -s "$out" ]]; then
-        cat "$out"
-        : >"$out"
-      fi
-      remove_pid_from_array active "$donepid"
-    done
-  else
-    local pid
-    for pid in "${pids[@]}"; do
-      wait "$pid" || any_err=1
-    done
-    local pid2
-    for pid2 in "${pids[@]}"; do
-      local out="${out_by_pid[$pid2]:-}"
-      [[ -n "$out" && -s "$out" ]] && cat "$out"
-    done
-  fi
+	  local any_err=0
+	  if [[ "$RUNNER_HAS_WAIT_NP" -eq 1 ]]; then
+	    local -a active=("${pids[@]}")
+	    local donepid=""
+	    while [[ "${#active[@]}" -gt 0 ]]; do
+	      local st=0
+	      if wait -n -p donepid "${active[@]}"; then st=0; else st=$?; fi
+	      if [[ "$st" -ne 0 ]]; then
+	        if [[ "$ALLOW_BROKEN_PIPE" -eq 1 && "$st" -eq 141 ]]; then :; else any_err=1; fi
+	      fi
+	      local out="${out_by_pid[$donepid]:-}"
+	      if [[ -n "$out" && -s "$out" ]]; then
+	        if [[ "$ALLOW_BROKEN_PIPE" -eq 1 ]]; then
+	          cat "$out" 2>/dev/null || true
+	        else
+	          cat "$out"
+	        fi
+	        : >"$out"
+	      fi
+	      remove_pid_from_array active "$donepid"
+	    done
+	  else
+	    local pid
+	    for pid in "${pids[@]}"; do
+	      local st=0
+	      if wait "$pid"; then st=0; else st=$?; fi
+	      if [[ "$st" -ne 0 ]]; then
+	        if [[ "$ALLOW_BROKEN_PIPE" -eq 1 && "$st" -eq 141 ]]; then :; else any_err=1; fi
+	      fi
+	    done
+	    local pid2
+	    for pid2 in "${pids[@]}"; do
+	      local out="${out_by_pid[$pid2]:-}"
+	      if [[ -n "$out" && -s "$out" ]]; then
+	        if [[ "$ALLOW_BROKEN_PIPE" -eq 1 ]]; then
+	          cat "$out" 2>/dev/null || true
+	        else
+	          cat "$out"
+	        fi
+	      fi
+	    done
+	  fi
 
   rm -rf "$gdir"
   [[ "$any_err" -eq 1 ]] && return 2
@@ -2978,7 +3102,7 @@ RG_DOC=()
 
   echo "$warn_groups" >"$tmp_rc2"
   exit 0
-) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$COUNTS_ONLY" "$tmp_chat" "$tmp_skip_rg" "$BEFORE_TO_LINE_START" "$CHAT_LINES_ONLY"
+) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$COUNTS_ONLY" "$tmp_chat" "$tmp_skip_rg" "$BEFORE_TO_LINE_START" "$CHAT_LINES_ONLY" "$PAGE" "$PAGE_SIZE"
 
 end_ns="$(date +%s%N)"
 
