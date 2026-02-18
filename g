@@ -11,6 +11,7 @@ AUDIT_SIZES=0
 CHAT_MODE=0
 CHAT_KEEP_TS=1
 CHAT_PREFILTER="${G_CHAT_PREFILTER:-1}"
+CHAT_CACHE_DIR=""
 NOCHAT=0
 
 SEARCH_HIDDEN=0
@@ -68,7 +69,7 @@ usage() {
   cat <<'EOF'
 Usage:
   g --audit [--sizes] [PATH...]
-  g [--hidden] [-l|--literal] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [--counts] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
+  g [--hidden] [-l|--literal] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [--counts] [--chat-cache[=DIR]] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
 
 Modes:
   --audit        Fast audit: counts hidden vs non-hidden by extension (fd + gawk only)
@@ -102,6 +103,7 @@ Options:
                  if only -B is provided, -A defaults to 0
   -v             verbose (end-of-run per-extension scan summary)
   --chat         search chat exports only (in chat mode -B/-A/-C are numeric message counts)
+  --chat-cache[=DIR]  cache parsed chat text for repeated --chat searches (default: /tmp/g_chat_cache)
   --chat-ts=VAL  keep (keep) or drop (drop) timestamps in chat output (default: keep)
   --chat-prefilter    prefilter chat files with raw rg before parsing (default: on)
   --no-chat-prefilter disable chat prefilter
@@ -187,6 +189,11 @@ for idx in "${!args[@]}"; do
     --literal) FIXED_STRINGS=1; continue ;;
     --chat-prefilter) CHAT_PREFILTER=1; continue ;;
     --no-chat-prefilter) CHAT_PREFILTER=0; continue ;;
+    --chat-cache) CHAT_CACHE_DIR="/tmp/g_chat_cache"; continue ;;
+    --chat-cache=*)
+      CHAT_CACHE_DIR="${arg#*=}"
+      [[ -z "$CHAT_CACHE_DIR" ]] && CHAT_CACHE_DIR="/tmp/g_chat_cache"
+      continue ;;
     --chat-prefilter=*)
       val="${arg#*=}"
       case "$val" in
@@ -298,8 +305,8 @@ while getopts ":B:A:C:vhul-:" opt; do
     h) usage; exit 0 ;;
     u) UCOUNT=$((UCOUNT + 1)) ;;
     l) FIXED_STRINGS=1 ;;
-    -)
-      case "${OPTARG}" in
+	    -)
+	      case "${OPTARG}" in
         help) usage; exit 0 ;;
         audit) AUDIT=1 ;;
         sizes) AUDIT_SIZES=1 ;;
@@ -313,12 +320,17 @@ while getopts ":B:A:C:vhul-:" opt; do
         chat) CHAT_MODE=1 ;;
         counts) COUNTS_ONLY=1 ;;
         case-sensitive) CASE_SENSITIVE=1 ;;
-        chat-prefilter) CHAT_PREFILTER=1 ;;
-        no-chat-prefilter) CHAT_PREFILTER=0 ;;
-        chat-prefilter=*)
-          val="${OPTARG#*=}"
-          case "$val" in
-            1|true|yes|on) CHAT_PREFILTER=1 ;;
+	        chat-prefilter) CHAT_PREFILTER=1 ;;
+	        no-chat-prefilter) CHAT_PREFILTER=0 ;;
+	        chat-cache) CHAT_CACHE_DIR="/tmp/g_chat_cache" ;;
+	        chat-cache=*)
+	          CHAT_CACHE_DIR="${OPTARG#*=}"
+	          [[ -z "$CHAT_CACHE_DIR" ]] && CHAT_CACHE_DIR="/tmp/g_chat_cache"
+	          ;;
+	        chat-prefilter=*)
+	          val="${OPTARG#*=}"
+	          case "$val" in
+	            1|true|yes|on) CHAT_PREFILTER=1 ;;
             0|false|no|off) CHAT_PREFILTER=0 ;;
             *) echo "Error: unknown value for --chat-prefilter (use on|off)" >&2; usage; exit 2 ;;
           esac
@@ -358,6 +370,10 @@ if [[ "$UCOUNT" -ge 1 ]]; then SEARCH_HIDDEN=1; fi
 if [[ "$UCOUNT" -ge 2 ]]; then NO_IGNORE=1; fi
 if [[ "$UCOUNT" -ge 3 ]]; then SEARCH_BINARY=1; SEARCH_UUU=1; fi
 export CHAT_KEEP_TS
+export G_CHAT_CACHE_DIR="$CHAT_CACHE_DIR"
+if [[ -n "$CHAT_CACHE_DIR" ]]; then
+  mkdir -p "$CHAT_CACHE_DIR" 2>/dev/null || true
+fi
 
 install_if_missing rg ripgrep
 install_if_missing fd fd-find fdfind
@@ -1169,12 +1185,68 @@ chmod +x "$tmp_doc"
 
 cat >"$tmp_chat" <<'PY'
 #!/usr/bin/env python3
-import os, sys, json, re, html, sqlite3
+import os, sys, json, re, html, sqlite3, hashlib, tempfile
 from html.parser import HTMLParser
 from datetime import datetime, timezone
 
 KEEP_TS = os.environ.get("CHAT_KEEP_TS", "1").lower() not in {"0", "false", "no", "off"}
 CHAT_PREFIX = "\x1eCHAT\t"
+
+# Optional cache: speeds up repeated --chat searches by avoiding re-parsing large exports.
+CACHE_DIR = (os.environ.get("G_CHAT_CACHE_DIR") or "").strip()
+CACHE_ENABLED = bool(CACHE_DIR)
+CACHE_VERSION = "1"
+CACHE_FH = None
+CACHE_TMP_PATH = ""
+CACHE_FINAL_PATH = ""
+CACHE_META_PATH = ""
+
+def _cache_key(path: str) -> str:
+  h = hashlib.sha1()
+  h.update(path.encode("utf-8", "surrogatepass"))
+  return h.hexdigest()[:16]
+
+def _cache_paths(path: str):
+  k = _cache_key(path)
+  return (
+    os.path.join(CACHE_DIR, f"{k}.chat.txt"),
+    os.path.join(CACHE_DIR, f"{k}.chat.meta.json"),
+  )
+
+def _cache_meta_ok(path: str, meta: dict) -> bool:
+  try:
+    st = os.stat(path)
+  except Exception:
+    return False
+  if not isinstance(meta, dict):
+    return False
+  if str(meta.get("v") or "") != CACHE_VERSION:
+    return False
+  if bool(meta.get("keep_ts", True)) != KEEP_TS:
+    return False
+  if int(meta.get("mtime_ns", -1)) != int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))):
+    return False
+  if int(meta.get("size", -1)) != int(st.st_size):
+    return False
+  return True
+
+def _try_emit_cache(path: str) -> bool:
+  global CACHE_FINAL_PATH, CACHE_META_PATH
+  if not CACHE_ENABLED:
+    return False
+  try:
+    final_path, meta_path = _cache_paths(path)
+    if not (os.path.exists(final_path) and os.path.exists(meta_path)):
+      return False
+    with open(meta_path, "r", encoding="utf-8", errors="replace") as mf:
+      meta = json.load(mf)
+    if not _cache_meta_ok(path, meta):
+      return False
+    with open(final_path, "rb") as f:
+      sys.stdout.buffer.write(f.read())
+    return True
+  except Exception:
+    return False
 
 def norm_text(s: str) -> str:
   return " ".join((s or "").replace("\r", "").replace("\n", " ").split())
@@ -1185,7 +1257,13 @@ def emit_chat_line(ts: str, sender: str, text: str):
   ts = norm_text(ts) if ts else ""
   sender = norm_text(sender) if sender else ""
   out_text = norm_text(text) if text is not None else ""
-  print(f"{CHAT_PREFIX}{ts}\t{sender}\t{out_text}")
+  b = (f"{CHAT_PREFIX}{ts}\t{sender}\t{out_text}\n").encode("utf-8", "surrogateescape")
+  sys.stdout.buffer.write(b)
+  if CACHE_FH is not None:
+    try:
+      CACHE_FH.write(b)
+    except Exception:
+      pass
 
 # ---------- Telegram HTML ----------
 class TelegramHTMLParser(HTMLParser):
@@ -2067,13 +2145,63 @@ def main():
     print("chat-preproc: expected exactly 1 arg: path", file=sys.stderr)
     return 2
   path = sys.argv[1]
+  if _try_emit_cache(path):
+    return 0
+
+  global CACHE_FH, CACHE_TMP_PATH, CACHE_FINAL_PATH, CACHE_META_PATH
+  if CACHE_ENABLED:
+    try:
+      os.makedirs(CACHE_DIR, exist_ok=True)
+      CACHE_FINAL_PATH, CACHE_META_PATH = _cache_paths(path)
+      fd, CACHE_TMP_PATH = tempfile.mkstemp(prefix=os.path.basename(CACHE_FINAL_PATH) + ".", dir=CACHE_DIR)
+      CACHE_FH = os.fdopen(fd, "wb")
+    except Exception:
+      CACHE_FH = None
+      CACHE_TMP_PATH = ""
+      CACHE_FINAL_PATH = ""
+      CACHE_META_PATH = ""
+
   handlers = handlers_for_path(path)
   for fn in handlers:
     try:
       if fn(path):
+        if CACHE_FH is not None and CACHE_TMP_PATH and CACHE_FINAL_PATH and CACHE_META_PATH:
+          try:
+            CACHE_FH.close()
+          except Exception:
+            pass
+          try:
+            os.replace(CACHE_TMP_PATH, CACHE_FINAL_PATH)
+          except Exception:
+            pass
+          try:
+            st = os.stat(path)
+            meta = {
+              "v": CACHE_VERSION,
+              "keep_ts": KEEP_TS,
+              "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))),
+              "size": int(st.st_size),
+            }
+            tmp_meta = CACHE_META_PATH + ".tmp"
+            with open(tmp_meta, "w", encoding="utf-8") as mf:
+              json.dump(meta, mf, ensure_ascii=False)
+            os.replace(tmp_meta, CACHE_META_PATH)
+          except Exception:
+            pass
         return 0
     except Exception:
       continue
+
+  if CACHE_FH is not None:
+    try:
+      CACHE_FH.close()
+    except Exception:
+      pass
+    if CACHE_TMP_PATH:
+      try:
+        os.unlink(CACHE_TMP_PATH)
+      except Exception:
+        pass
   # Fallback: pass-through
   try:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
