@@ -14,6 +14,7 @@ CHAT_PREFILTER="${G_CHAT_PREFILTER:-1}"
 CHAT_CACHE_DIR="/tmp/g_chat_cache"
 CHAT_CACHE_KEEP="${G_CHAT_CACHE_KEEP:-0}"
 CHAT_CACHE_MAX_MB="${G_CHAT_CACHE_MAX_MB:-300}"
+CHAT_NO_NORM=0
 MERGE_MODE=0
 PAGE=0
 PAGE_SIZE=10
@@ -116,6 +117,7 @@ Options:
                 env: G_CHAT_CACHE_KEEP (LRU count cap, default unlimited), G_CHAT_CACHE_MAX_MB (size cap, default 300)
   --merge        (chat-only) merge repeated hits in the same message; output 1 block per matching message (format like -C 0)
                 (deprecated alias: --chat-lines)
+  --no-norm      (chat-only) preserve message whitespace/newlines by emitting literal \\n/\\t escapes instead of collapsing
   --page N       (chat-only, requires --merge and -C 0) show page N ordered by newest timestamp (default page-size 10)
                 first run scans and caches results; subsequent pages reuse /tmp/g_chat_query_cache
   --page-size N  (chat-only) page size for --page (default 10)
@@ -299,8 +301,8 @@ for idx in "${!args[@]}"; do
     continue
   fi
 
-	arg="${args[$idx]}"
-	case "$arg" in
+  arg="${args[$idx]}"
+  case "$arg" in
     --)
       filtered+=("${args[@]:$idx}")
       break
@@ -318,31 +320,32 @@ for idx in "${!args[@]}"; do
     --counts) COUNTS_ONLY=1; continue ;;
     --case-sensitive) CASE_SENSITIVE=1; continue ;;
     --literal) FIXED_STRINGS=1; continue ;;
-	    --chat-prefilter) CHAT_PREFILTER=1; continue ;;
-	    --no-chat-prefilter) CHAT_PREFILTER=0; continue ;;
-	    --chat-cache|--chat-cache=*)
-	      # Deprecated: chat cache is always enabled and always uses /tmp/g_chat_cache.
-	      continue ;;
-	    --merge) MERGE_MODE=1; continue ;;
-	    --chat-lines) MERGE_MODE=1; continue ;;
-	    --page)
-	      PAGE="${args[$((idx + 1))]:-}"
-	      skip_next=1
-	      continue ;;
-	    --page=*)
-	      PAGE="${arg#*=}"
-	      continue ;;
-	    --page-size)
-	      PAGE_SIZE="${args[$((idx + 1))]:-}"
-	      skip_next=1
-	      continue ;;
-	    --page-size=*)
-	      PAGE_SIZE="${arg#*=}"
-	      continue ;;
-	    --chat-prefilter=*)
-	      val="${arg#*=}"
-	      case "$val" in
-	        1|true|yes|on) CHAT_PREFILTER=1 ;;
+    --no-norm) CHAT_NO_NORM=1; continue ;;
+    --chat-prefilter) CHAT_PREFILTER=1; continue ;;
+    --no-chat-prefilter) CHAT_PREFILTER=0; continue ;;
+    --chat-cache|--chat-cache=*)
+      # Deprecated: chat cache is always enabled and always uses /tmp/g_chat_cache.
+      continue ;;
+    --merge) MERGE_MODE=1; continue ;;
+    --chat-lines) MERGE_MODE=1; continue ;;
+    --page)
+      PAGE="${args[$((idx + 1))]:-}"
+      skip_next=1
+      continue ;;
+    --page=*)
+      PAGE="${arg#*=}"
+      continue ;;
+    --page-size)
+      PAGE_SIZE="${args[$((idx + 1))]:-}"
+      skip_next=1
+      continue ;;
+    --page-size=*)
+      PAGE_SIZE="${arg#*=}"
+      continue ;;
+    --chat-prefilter=*)
+      val="${arg#*=}"
+      case "$val" in
+        1|true|yes|on) CHAT_PREFILTER=1 ;;
         0|false|no|off) CHAT_PREFILTER=0 ;;
         *) echo "Error: unknown value for --chat-prefilter (use on|off)" >&2; exit 2 ;;
       esac
@@ -450,8 +453,8 @@ while getopts ":B:A:C:vhul-:" opt; do
     h) usage; exit 0 ;;
     u) UCOUNT=$((UCOUNT + 1)) ;;
     l) FIXED_STRINGS=1 ;;
-		    -)
-		      case "${OPTARG}" in
+    -)
+      case "${OPTARG}" in
         help) usage; exit 0 ;;
         audit) AUDIT=1 ;;
         sizes) AUDIT_SIZES=1 ;;
@@ -464,18 +467,19 @@ while getopts ":B:A:C:vhul-:" opt; do
         blacklist) EXT_FILTER_MODE="blacklist" ;;
         chat) CHAT_MODE=1 ;;
         counts) COUNTS_ONLY=1 ;;
-	        case-sensitive) CASE_SENSITIVE=1 ;;
-	        chat-prefilter) CHAT_PREFILTER=1 ;;
-	        no-chat-prefilter) CHAT_PREFILTER=0 ;;
-	        chat-cache|chat-cache=*)
-	          # Deprecated: chat cache is always enabled and always uses /tmp/g_chat_cache.
-	          ;;
-	        merge) MERGE_MODE=1 ;;
-	        chat-lines) MERGE_MODE=1 ;;
-			        chat-prefilter=*)
-			          val="${OPTARG#*=}"
-			          case "$val" in
-	            1|true|yes|on) CHAT_PREFILTER=1 ;;
+        case-sensitive) CASE_SENSITIVE=1 ;;
+        no-norm) CHAT_NO_NORM=1 ;;
+        chat-prefilter) CHAT_PREFILTER=1 ;;
+        no-chat-prefilter) CHAT_PREFILTER=0 ;;
+        chat-cache|chat-cache=*)
+          # Deprecated: chat cache is always enabled and always uses /tmp/g_chat_cache.
+          ;;
+        merge) MERGE_MODE=1 ;;
+        chat-lines) MERGE_MODE=1 ;;
+        chat-prefilter=*)
+          val="${OPTARG#*=}"
+          case "$val" in
+            1|true|yes|on) CHAT_PREFILTER=1 ;;
             0|false|no|off) CHAT_PREFILTER=0 ;;
             *) echo "Error: unknown value for --chat-prefilter (use on|off)" >&2; usage; exit 2 ;;
           esac
@@ -540,6 +544,7 @@ if [[ "$UCOUNT" -ge 2 ]]; then NO_IGNORE=1; fi
 if [[ "$UCOUNT" -ge 3 ]]; then SEARCH_BINARY=1; SEARCH_UUU=1; fi
 export CHAT_KEEP_TS
 export G_CHAT_CACHE_DIR="$CHAT_CACHE_DIR"
+export G_CHAT_NO_NORM="$CHAT_NO_NORM"
 if [[ -n "$CHAT_CACHE_DIR" ]]; then
   mkdir -p "$CHAT_CACHE_DIR" 2>/dev/null || true
   prune_chat_cache "$CHAT_CACHE_DIR" "$CHAT_CACHE_KEEP" "$CHAT_CACHE_MAX_MB"
@@ -786,14 +791,15 @@ QUERY_CACHE_META=""
   mkdir -p "$QUERY_CACHE_DIR" 2>/dev/null || true
 
   QUERY_KEY="$(
-    python3 - "$PATTERN" "$FIXED_STRINGS" "$CASE_SENSITIVE" "$CHAT_KEEP_TS" "$PAGE_SIZE" "${PATHS[@]}" <<'PY'
+    python3 - "$PATTERN" "$FIXED_STRINGS" "$CASE_SENSITIVE" "$CHAT_KEEP_TS" "$CHAT_NO_NORM" "$PAGE_SIZE" "${PATHS[@]}" <<'PY'
 import hashlib, json, sys
 pat = sys.argv[1]
 fixed = int(sys.argv[2])
 case = int(sys.argv[3])
 keep_ts = int(sys.argv[4])
-page_size = int(sys.argv[5])
-roots = sys.argv[6:]
+no_norm = int(sys.argv[5])
+page_size = int(sys.argv[6])
+roots = sys.argv[7:]
 payload = {
   "v": 1,
   "mode": "chat_merge_page_newest",
@@ -801,6 +807,7 @@ payload = {
   "fixed": fixed,
   "case_sensitive": case,
   "keep_ts": keep_ts,
+  "no_norm": no_norm,
   "page_size": page_size,
   "roots": roots,
 }
@@ -970,9 +977,20 @@ CHAT_PREFIX = "\x1eCHAT\t"
 preproc_path = sys.argv[8] if len(sys.argv) > 8 else ""
 skip_rg_path = sys.argv[9] if len(sys.argv) > 9 else ""
 skipped_rg = set()
+NO_NORM = os.environ.get("G_CHAT_NO_NORM", "0").lower() in {"1", "true", "yes", "on"}
 
 printed_chat_line_keys = set()
 query_records = {}
+
+def one_line_preserve(s: str) -> str:
+  # Keep whitespace as-is, but emit as a single line with reversible \\n/\\t escapes.
+  if s is None:
+    return ""
+  t = str(s)
+  t = t.replace("\r\n", "\n").replace("\r", "\n")
+  t = t.replace("\t", "\\t")
+  t = t.replace("\n", "\\n")
+  return t
 
 def parse_ts_epoch(ts: str) -> int:
   ts = (ts or "").strip()
@@ -1250,7 +1268,8 @@ class _FacebookHTMLParser(HTMLParser):
       self.in_header = False
       self.field = None
     if self.in_p and tag == "p":
-      text = _norm_text(html.unescape("".join(self.p_text)))
+      raw = html.unescape("".join(self.p_text))
+      text = one_line_preserve(raw) if NO_NORM else _norm_text(raw)
       ts, sender = self.pending_header or ("", "")
       self.messages.append((text, sender, ts))
       if self.limit and len(self.messages) >= self.limit:
@@ -1693,11 +1712,12 @@ CHAT_PREFIX = "\x1eCHAT\t"
 # Optional cache: speeds up repeated --chat searches by avoiding re-parsing large exports.
 CACHE_DIR = (os.environ.get("G_CHAT_CACHE_DIR") or "").strip()
 CACHE_ENABLED = bool(CACHE_DIR)
-CACHE_VERSION = "1"
+CACHE_VERSION = "2"
 CACHE_FH = None
 CACHE_TMP_PATH = ""
 CACHE_FINAL_PATH = ""
 CACHE_META_PATH = ""
+NO_NORM = os.environ.get("G_CHAT_NO_NORM", "0").lower() in {"1", "true", "yes", "on"}
 
 def _cache_key(path: str) -> str:
   h = hashlib.sha1()
@@ -1722,6 +1742,8 @@ def _cache_meta_ok(path: str, meta: dict) -> bool:
     return False
   if bool(meta.get("keep_ts", True)) != KEEP_TS:
     return False
+  if bool(meta.get("no_norm", False)) != NO_NORM:
+    return False
   if int(meta.get("mtime_ns", -1)) != int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))):
     return False
   if int(meta.get("size", -1)) != int(st.st_size):
@@ -1732,33 +1754,46 @@ def _try_emit_cache(path: str) -> bool:
   global CACHE_FINAL_PATH, CACHE_META_PATH
   if not CACHE_ENABLED:
     return False
-	  try:
-	    final_path, meta_path = _cache_paths(path)
-	    if not (os.path.exists(final_path) and os.path.exists(meta_path)):
-	      return False
-	    with open(meta_path, "r", encoding="utf-8", errors="replace") as mf:
-	      meta = json.load(mf)
-	    if not _cache_meta_ok(path, meta):
-	      return False
-	    with open(final_path, "rb") as f:
-	      sys.stdout.buffer.write(f.read())
-	    try:
-	      os.utime(meta_path, None)
-	    except Exception:
-	      pass
-	    return True
-	  except Exception:
-	    return False
+  try:
+    final_path, meta_path = _cache_paths(path)
+    if not (os.path.exists(final_path) and os.path.exists(meta_path)):
+      return False
+    with open(meta_path, "r", encoding="utf-8", errors="replace") as mf:
+      meta = json.load(mf)
+    if not _cache_meta_ok(path, meta):
+      return False
+    with open(final_path, "rb") as f:
+      sys.stdout.buffer.write(f.read())
+    try:
+      os.utime(meta_path, None)
+    except Exception:
+      pass
+    return True
+  except Exception:
+    return False
 
 def norm_text(s: str) -> str:
   return " ".join((s or "").replace("\r", "").replace("\n", " ").split())
+
+def one_line_preserve(s: str) -> str:
+  # Keep whitespace as-is, but emit as a single line with reversible \\n/\\t escapes.
+  if s is None:
+    return ""
+  t = str(s)
+  t = t.replace("\r\n", "\n").replace("\r", "\n")
+  t = t.replace("\t", "\\t")
+  t = t.replace("\n", "\\n")
+  return t
 
 def emit_chat_line(ts: str, sender: str, text: str):
   if not KEEP_TS:
     ts = ""
   ts = norm_text(ts) if ts else ""
   sender = norm_text(sender) if sender else ""
-  out_text = norm_text(text) if text is not None else ""
+  if NO_NORM:
+    out_text = one_line_preserve(text)
+  else:
+    out_text = norm_text(text) if text is not None else ""
   b = (f"{CHAT_PREFIX}{ts}\t{sender}\t{out_text}\n").encode("utf-8", "surrogateescape")
   sys.stdout.buffer.write(b)
   if CACHE_FH is not None:
@@ -1836,7 +1871,7 @@ class TelegramHTMLParser(HTMLParser):
     sender = sender_raw or self.last_sender
     if sender_raw:
       self.last_sender = sender_raw
-    text = norm_text("".join(self.cur.get("text", [])))
+    text = "".join(self.cur.get("text", []))
     msg_id = self.cur.get("id")
     ts = self.cur.get("ts") or ""
     if ts and " " in ts and "T" not in ts:
@@ -1913,7 +1948,7 @@ class FacebookHTMLParser(HTMLParser):
       self.in_header = False
       self.field = None
     if self.in_p and tag == "p":
-      text = norm_text("".join(self.p_text))
+      text = "".join(self.p_text)
       ts, sender = self.pending_header or ("", "")
       emit_chat_line(ts, sender, text)
       self.emitted += 1
@@ -1973,7 +2008,7 @@ def emit_telegram_messages(msgs):
         text = f"[{mt}]"
     sender = msg.get("from", "") or msg.get("actor", "")
     ts = msg.get("date")
-    emit_chat_line(ts or "", sender or "", norm_text(text))
+    emit_chat_line(ts or "", sender or "", text)
     emitted += 1
   return emitted
 
@@ -2016,7 +2051,7 @@ def emit_messenger_messages(msgs):
         if isinstance(att, dict) and att.get("uri"):
           labels.append(f"[{att.get('uri').split('/')[-1]}]")
       text = " ".join(labels) if labels else "[attachment]"
-    emit_chat_line(ts_from_ms(msg.get("timestamp_ms")), sender or "", norm_text(text or ""))
+    emit_chat_line(ts_from_ms(msg.get("timestamp_ms")), sender or "", text or "")
     emitted += 1
   return emitted
 
@@ -2076,7 +2111,7 @@ def parse_telegram_txt(path: str) -> bool:
   if len(messages) < 2 and not saw_header:
     return False
   for msg in messages:
-    emit_chat_line(msg.get("ts", ""), msg.get("sender", ""), norm_text(msg.get("text", "")))
+    emit_chat_line(msg.get("ts", ""), msg.get("sender", ""), msg.get("text", ""))
   return True
 
 # ---------- WhatsApp TXT ----------
@@ -2116,7 +2151,7 @@ def parse_whatsapp_txt(path: str) -> bool:
   if len(messages) < 2:
     return False
   for msg in messages:
-    emit_chat_line(msg.get("ts", ""), msg.get("sender", ""), norm_text(msg.get("text", "")))
+    emit_chat_line(msg.get("ts", ""), msg.get("sender", ""), msg.get("text", ""))
   return True
 
 # ---------- Generic JSON (list of dict messages) ----------
@@ -2132,7 +2167,7 @@ def emit_generic_messages(items):
       continue
     sender = item.get("from") or item.get("sender") or item.get("author") or item.get("name") or ""
     ts = item.get("sent_date") or item.get("date") or item.get("timestamp") or ""
-    emit_chat_line(str(ts), str(sender), norm_text(str(txt)))
+    emit_chat_line(str(ts), str(sender), str(txt))
     emitted += 1
   return emitted
 
@@ -2178,7 +2213,7 @@ def parse_gemini_json(path: str) -> bool:
         if model:
             sender = model
 
-    emit_chat_line(ts, sender, norm_text(content))
+    emit_chat_line(ts, sender, content)
     emitted += 1
   return emitted > 0
 
@@ -2253,7 +2288,7 @@ def _emit_chatgpt_export(convs) -> bool:
           # Some exports/HTML embed HTML entities inside JSON strings.
           text = html.unescape(text or "")
           if text and text.strip():
-            emit_chat_line(ts, sender, norm_text(text))
+            emit_chat_line(ts, sender, text)
             emitted += 1
       children = node.get("children") or []
       if isinstance(children, list) and children:
@@ -2373,7 +2408,7 @@ def parse_deepseek_json(path: str) -> bool:
               continue
             else:
               sender = ftyp
-            emit_chat_line(ts, sender, norm_text(txt))
+            emit_chat_line(ts, sender, txt)
             emitted += 1
       children = node.get("children") or []
       if isinstance(children, list):
@@ -2423,7 +2458,7 @@ def parse_grok_json(path: str) -> bool:
         continue
       sender = str(resp.get("sender") or resp.get("model") or "")
       ts = _mongo_date_to_iso(resp.get("create_time")) or str(resp.get("create_time") or "")
-      emit_chat_line(ts, sender, norm_text(msg))
+      emit_chat_line(ts, sender, msg)
       emitted += 1
   return emitted > 0
 
@@ -2473,7 +2508,7 @@ def parse_google_gemini_myactivity_json(path: str) -> bool:
           attached.append(str(s.get("url")))
     if prompt:
       suffix = f" [attached: {', '.join(attached)}]" if attached else ""
-      emit_chat_line(ts, "USER", norm_text(prompt + suffix))
+      emit_chat_line(ts, "USER", prompt + suffix)
       emitted += 1
     safe = it.get("safeHtmlItem") or []
     parts = []
@@ -2483,7 +2518,7 @@ def parse_google_gemini_myactivity_json(path: str) -> bool:
           h = s.get("html")
           if isinstance(h, str) and h.strip():
             parts.append(_strip_html(html.unescape(h)))
-    resp = norm_text(" ".join(parts))
+    resp = " ".join(parts)
     if resp:
       emit_chat_line(ts, "GEMINI", resp)
       emitted += 1
@@ -2617,7 +2652,7 @@ def parse_telegram_sqlite(path: str) -> bool:
     for mid, sender, text, ts in cur:
       if text is None or str(text).strip() == "":
         continue
-      emit_chat_line(ts_from_sec(ts), str(sender), norm_text(str(text)))
+      emit_chat_line(ts_from_sec(ts), str(sender), str(text))
       emitted += 1
   except Exception:
     return False
@@ -2681,20 +2716,21 @@ def main():
             meta = {
               "v": CACHE_VERSION,
               "keep_ts": KEEP_TS,
+              "no_norm": NO_NORM,
               "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))),
               "size": int(st.st_size),
             }
             tmp_meta = CACHE_META_PATH + ".tmp"
-	            with open(tmp_meta, "w", encoding="utf-8") as mf:
-	              json.dump(meta, mf, ensure_ascii=False)
-	            os.replace(tmp_meta, CACHE_META_PATH)
-	            try:
-	              os.utime(CACHE_META_PATH, None)
-	            except Exception:
-	              pass
-	          except Exception:
-	            pass
-	        return 0
+            with open(tmp_meta, "w", encoding="utf-8") as mf:
+              json.dump(meta, mf, ensure_ascii=False)
+            os.replace(tmp_meta, CACHE_META_PATH)
+            try:
+              os.utime(CACHE_META_PATH, None)
+            except Exception:
+              pass
+          except Exception:
+            pass
+        return 0
     except Exception:
       continue
 
