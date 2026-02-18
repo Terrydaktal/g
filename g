@@ -12,6 +12,7 @@ CHAT_MODE=0
 CHAT_KEEP_TS=1
 CHAT_PREFILTER="${G_CHAT_PREFILTER:-1}"
 CHAT_CACHE_DIR="/tmp/g_chat_cache"
+CHAT_CACHE_KEEP="${G_CHAT_CACHE_KEEP:-0}"
 MERGE_MODE=0
 PAGE=0
 PAGE_SIZE=10
@@ -151,6 +152,29 @@ prune_query_cache() {
     meta="${metas[$i]}"
     key="$(basename "$meta" .meta.json)"
     rm -f "$dir/$key.dat" "$dir/$key.idx" "$dir/$key.meta.json" 2>/dev/null || true
+  done
+}
+
+prune_chat_cache() {
+  local dir="$1"
+  local keep="${2:-0}"
+  [[ -d "$dir" ]] || return 0
+  [[ "$keep" =~ ^[0-9]+$ ]] || keep=0
+  (( keep <= 0 )) && return 0
+
+  # Remove orphaned tmp files (best effort).
+  rm -f "$dir"/*.tmp 2>/dev/null || true
+
+  local -a metas=()
+  mapfile -t metas < <(ls -1t "$dir"/*.chat.meta.json 2>/dev/null || true)
+  local n="${#metas[@]}"
+  (( n <= keep )) && return 0
+
+  local i meta key
+  for ((i=keep; i<n; i++)); do
+    meta="${metas[$i]}"
+    key="$(basename "$meta" .chat.meta.json)"
+    rm -f "$dir/$key.chat.txt" "$dir/$key.chat.meta.json" 2>/dev/null || true
   done
 }
 
@@ -452,6 +476,7 @@ export CHAT_KEEP_TS
 export G_CHAT_CACHE_DIR="$CHAT_CACHE_DIR"
 if [[ -n "$CHAT_CACHE_DIR" ]]; then
   mkdir -p "$CHAT_CACHE_DIR" 2>/dev/null || true
+  prune_chat_cache "$CHAT_CACHE_DIR" "$CHAT_CACHE_KEEP"
 fi
 
 install_if_missing rg ripgrep
@@ -1641,19 +1666,23 @@ def _try_emit_cache(path: str) -> bool:
   global CACHE_FINAL_PATH, CACHE_META_PATH
   if not CACHE_ENABLED:
     return False
-  try:
-    final_path, meta_path = _cache_paths(path)
-    if not (os.path.exists(final_path) and os.path.exists(meta_path)):
-      return False
-    with open(meta_path, "r", encoding="utf-8", errors="replace") as mf:
-      meta = json.load(mf)
-    if not _cache_meta_ok(path, meta):
-      return False
-    with open(final_path, "rb") as f:
-      sys.stdout.buffer.write(f.read())
-    return True
-  except Exception:
-    return False
+	  try:
+	    final_path, meta_path = _cache_paths(path)
+	    if not (os.path.exists(final_path) and os.path.exists(meta_path)):
+	      return False
+	    with open(meta_path, "r", encoding="utf-8", errors="replace") as mf:
+	      meta = json.load(mf)
+	    if not _cache_meta_ok(path, meta):
+	      return False
+	    with open(final_path, "rb") as f:
+	      sys.stdout.buffer.write(f.read())
+	    try:
+	      os.utime(meta_path, None)
+	    except Exception:
+	      pass
+	    return True
+	  except Exception:
+	    return False
 
 def norm_text(s: str) -> str:
   return " ".join((s or "").replace("\r", "").replace("\n", " ").split())
@@ -2590,12 +2619,16 @@ def main():
               "size": int(st.st_size),
             }
             tmp_meta = CACHE_META_PATH + ".tmp"
-            with open(tmp_meta, "w", encoding="utf-8") as mf:
-              json.dump(meta, mf, ensure_ascii=False)
-            os.replace(tmp_meta, CACHE_META_PATH)
-          except Exception:
-            pass
-        return 0
+	            with open(tmp_meta, "w", encoding="utf-8") as mf:
+	              json.dump(meta, mf, ensure_ascii=False)
+	            os.replace(tmp_meta, CACHE_META_PATH)
+	            try:
+	              os.utime(CACHE_META_PATH, None)
+	            except Exception:
+	              pass
+	          except Exception:
+	            pass
+	        return 0
     except Exception:
       continue
 
@@ -3389,6 +3422,9 @@ fi
 
 if [[ "$PAGE" != "0" ]]; then
   prune_query_cache "$QUERY_CACHE_DIR" "$QUERY_CACHE_KEEP"
+fi
+if [[ "$CHAT_MODE" -eq 1 ]]; then
+  prune_chat_cache "$CHAT_CACHE_DIR" "$CHAT_CACHE_KEEP"
 fi
 
 match_count=0
