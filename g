@@ -13,6 +13,7 @@ CHAT_KEEP_TS=1
 CHAT_PREFILTER="${G_CHAT_PREFILTER:-1}"
 CHAT_CACHE_DIR="/tmp/g_chat_cache"
 CHAT_CACHE_KEEP="${G_CHAT_CACHE_KEEP:-0}"
+CHAT_CACHE_MAX_MB="${G_CHAT_CACHE_MAX_MB:-300}"
 MERGE_MODE=0
 PAGE=0
 PAGE_SIZE=10
@@ -112,6 +113,7 @@ Options:
   -v             verbose (end-of-run per-extension scan summary)
   --chat         search chat exports only (in chat mode -B/-A/-C are numeric message counts)
   (chat cache is always enabled; uses /tmp/g_chat_cache)
+                env: G_CHAT_CACHE_KEEP (LRU count cap, default unlimited), G_CHAT_CACHE_MAX_MB (size cap, default 300)
   --merge        (chat-only) merge repeated hits in the same message; output 1 block per matching message (format like -C 0)
                 (deprecated alias: --chat-lines)
   --page N       (chat-only, requires --merge and -C 0) show page N ordered by newest timestamp (default page-size 10)
@@ -158,24 +160,88 @@ prune_query_cache() {
 prune_chat_cache() {
   local dir="$1"
   local keep="${2:-0}"
+  local max_mb="${3:-0}"
   [[ -d "$dir" ]] || return 0
   [[ "$keep" =~ ^[0-9]+$ ]] || keep=0
-  (( keep <= 0 )) && return 0
+  [[ "$max_mb" =~ ^[0-9]+$ ]] || max_mb=0
 
-  # Remove orphaned tmp files (best effort).
-  rm -f "$dir"/*.tmp 2>/dev/null || true
+  python3 - "$dir" "$keep" "$max_mb" <<'PY' | xargs -0 -r rm -f 2>/dev/null || true
+import os, sys
 
-  local -a metas=()
-  mapfile -t metas < <(ls -1t "$dir"/*.chat.meta.json 2>/dev/null || true)
-  local n="${#metas[@]}"
-  (( n <= keep )) && return 0
+dirp = sys.argv[1]
+keep = int(sys.argv[2])
+max_mb = int(sys.argv[3])
+max_bytes = max_mb * 1024 * 1024
 
-  local i meta key
-  for ((i=keep; i<n; i++)); do
-    meta="${metas[$i]}"
-    key="$(basename "$meta" .chat.meta.json)"
-    rm -f "$dir/$key.chat.txt" "$dir/$key.chat.meta.json" 2>/dev/null || true
-  done
+def pjoin(*a): return os.path.join(*a)
+
+to_delete = []
+
+try:
+  os.makedirs(dirp, exist_ok=True)
+except Exception:
+  pass
+
+# Remove tmp shards.
+try:
+  for name in os.listdir(dirp):
+    if name.endswith(".tmp"):
+      to_delete.append(pjoin(dirp, name))
+except Exception:
+  pass
+
+entries = []  # (mtime, key, meta_path, txt_path, bytes)
+
+try:
+  for name in os.listdir(dirp):
+    if not name.endswith(".chat.meta.json"):
+      continue
+    key = name[: -len(".chat.meta.json")]
+    meta = pjoin(dirp, name)
+    txt = pjoin(dirp, key + ".chat.txt")
+    if not os.path.exists(txt):
+      to_delete.extend([meta])
+      continue
+    try:
+      st_meta = os.stat(meta)
+      st_txt = os.stat(txt)
+    except Exception:
+      to_delete.extend([meta, txt])
+      continue
+    mtime = st_meta.st_mtime
+    size = int(st_meta.st_size) + int(st_txt.st_size)
+    entries.append((mtime, key, meta, txt, size))
+except Exception:
+  entries = []
+
+# Sort newest first (LRU based on meta mtime).
+entries.sort(key=lambda x: x[0], reverse=True)
+
+# Apply keep-count limit.
+if keep > 0 and len(entries) > keep:
+  for (_mt, _k, meta, txt, _sz) in entries[keep:]:
+    to_delete.extend([meta, txt])
+  entries = entries[:keep]
+
+# Apply size limit (only if max_mb > 0).
+if max_bytes > 0:
+  total = sum(e[4] for e in entries)
+  if total > max_bytes:
+    # delete oldest first
+    for (_mt, _k, meta, txt, sz) in reversed(entries):
+      if total <= max_bytes:
+        break
+      to_delete.extend([meta, txt])
+      total -= sz
+
+out = sys.stdout.buffer
+seen = set()
+for p in to_delete:
+  if not p or p in seen:
+    continue
+  seen.add(p)
+  out.write(p.encode("utf-8", "surrogateescape") + b"\0")
+PY
 }
 
 # ------------------------------------------------------------
@@ -476,7 +542,7 @@ export CHAT_KEEP_TS
 export G_CHAT_CACHE_DIR="$CHAT_CACHE_DIR"
 if [[ -n "$CHAT_CACHE_DIR" ]]; then
   mkdir -p "$CHAT_CACHE_DIR" 2>/dev/null || true
-  prune_chat_cache "$CHAT_CACHE_DIR" "$CHAT_CACHE_KEEP"
+  prune_chat_cache "$CHAT_CACHE_DIR" "$CHAT_CACHE_KEEP" "$CHAT_CACHE_MAX_MB"
 fi
 
 install_if_missing rg ripgrep
@@ -3423,10 +3489,6 @@ fi
 if [[ "$PAGE" != "0" ]]; then
   prune_query_cache "$QUERY_CACHE_DIR" "$QUERY_CACHE_KEEP"
 fi
-if [[ "$CHAT_MODE" -eq 1 ]]; then
-  prune_chat_cache "$CHAT_CACHE_DIR" "$CHAT_CACHE_KEEP"
-fi
-
 match_count=0
 [[ -s "$tmp_mc" ]] && match_count="$(cat "$tmp_mc" 2>/dev/null || echo 0)"
 
