@@ -11,12 +11,14 @@ AUDIT_SIZES=0
 CHAT_MODE=0
 CHAT_KEEP_TS=1
 CHAT_PREFILTER="${G_CHAT_PREFILTER:-1}"
-CHAT_CACHE_DIR=""
+CHAT_CACHE_DIR="/tmp/g_chat_cache"
 MERGE_MODE=0
 PAGE=0
 PAGE_SIZE=10
 ALLOW_BROKEN_PIPE=0
 NOCHAT=0
+
+QUERY_CACHE_DIR="/tmp/g_chat_query_cache"
 
 SEARCH_HIDDEN=0
 SEARCH_UUU=0
@@ -73,7 +75,7 @@ usage() {
   cat <<'EOF'
 Usage:
   g --audit [--sizes] [PATH...]
-  g [--hidden] [-l|--literal] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [--counts] [--chat-cache[=DIR]] [--page N] [--page-size N] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
+  g [--hidden] [-l|--literal] [-u|-uu|-uuu] [--no_ignore] [--binary] [--nochat] [--whitelist|--blacklist] [--counts] [--page N] [--page-size N] [-B N] [-A N] [-C N] [-v] PATTERN [PATH...]
 
 Modes:
   --audit        Fast audit: counts hidden vs non-hidden by extension (fd + gawk only)
@@ -107,10 +109,11 @@ Options:
                  if only -B is provided, -A defaults to 0
   -v             verbose (end-of-run per-extension scan summary)
   --chat         search chat exports only (in chat mode -B/-A/-C are numeric message counts)
-  --chat-cache[=DIR]  cache parsed chat text for repeated --chat searches (default: /tmp/g_chat_cache)
+  (chat cache is always enabled; uses /tmp/g_chat_cache)
   --merge        (chat-only) merge repeated hits in the same message; output 1 block per matching message (format like -C 0)
                 (deprecated alias: --chat-lines)
-  --page N       (chat-only, requires --merge and -C 0) show only page N (default page-size 10); stops search early
+  --page N       (chat-only, requires --merge and -C 0) show page N ordered by newest timestamp (default page-size 10)
+                first run scans and caches results; subsequent pages reuse /tmp/g_chat_query_cache
   --page-size N  (chat-only) page size for --page (default 10)
   --chat-ts=VAL  keep (keep) or drop (drop) timestamps in chat output (default: keep)
   --chat-prefilter    prefilter chat files with raw rg before parsing (default: on)
@@ -195,12 +198,10 @@ for idx in "${!args[@]}"; do
     --counts) COUNTS_ONLY=1; continue ;;
     --case-sensitive) CASE_SENSITIVE=1; continue ;;
     --literal) FIXED_STRINGS=1; continue ;;
-    --chat-prefilter) CHAT_PREFILTER=1; continue ;;
-    --no-chat-prefilter) CHAT_PREFILTER=0; continue ;;
-    --chat-cache) CHAT_CACHE_DIR="/tmp/g_chat_cache"; continue ;;
-	    --chat-cache=*)
-	      CHAT_CACHE_DIR="${arg#*=}"
-	      [[ -z "$CHAT_CACHE_DIR" ]] && CHAT_CACHE_DIR="/tmp/g_chat_cache"
+	    --chat-prefilter) CHAT_PREFILTER=1; continue ;;
+	    --no-chat-prefilter) CHAT_PREFILTER=0; continue ;;
+	    --chat-cache|--chat-cache=*)
+	      # Deprecated: chat cache is always enabled and always uses /tmp/g_chat_cache.
 	      continue ;;
 	    --merge) MERGE_MODE=1; continue ;;
 	    --chat-lines) MERGE_MODE=1; continue ;;
@@ -343,16 +344,14 @@ while getopts ":B:A:C:vhul-:" opt; do
         blacklist) EXT_FILTER_MODE="blacklist" ;;
         chat) CHAT_MODE=1 ;;
         counts) COUNTS_ONLY=1 ;;
-        case-sensitive) CASE_SENSITIVE=1 ;;
+	        case-sensitive) CASE_SENSITIVE=1 ;;
 	        chat-prefilter) CHAT_PREFILTER=1 ;;
 	        no-chat-prefilter) CHAT_PREFILTER=0 ;;
-	        chat-cache) CHAT_CACHE_DIR="/tmp/g_chat_cache" ;;
-		        chat-cache=*)
-		          CHAT_CACHE_DIR="${OPTARG#*=}"
-		          [[ -z "$CHAT_CACHE_DIR" ]] && CHAT_CACHE_DIR="/tmp/g_chat_cache"
-		          ;;
-			        merge) MERGE_MODE=1 ;;
-			        chat-lines) MERGE_MODE=1 ;;
+	        chat-cache|chat-cache=*)
+	          # Deprecated: chat cache is always enabled and always uses /tmp/g_chat_cache.
+	          ;;
+	        merge) MERGE_MODE=1 ;;
+	        chat-lines) MERGE_MODE=1 ;;
 			        chat-prefilter=*)
 			          val="${OPTARG#*=}"
 			          case "$val" in
@@ -408,11 +407,11 @@ if [[ "$PAGE" != "0" ]]; then
     echo "Error: --page-size must be an integer >= 1" >&2
     exit 2
   fi
-  if [[ "$BEFORE" -ne 0 || "$AFTER" -ne 0 ]]; then
-    echo "Error: --page requires -C 0 (or -B 0 -A 0) so it can stop early after printing a page." >&2
-    exit 2
-  fi
-  ALLOW_BROKEN_PIPE=1
+	if [[ "$BEFORE" -ne 0 || "$AFTER" -ne 0 ]]; then
+	    echo "Error: --page requires -C 0 (or -B 0 -A 0)." >&2
+	    exit 2
+	fi
+	ALLOW_BROKEN_PIPE=1
 fi
 
 # Apply -u/-uu/-uuu semantics
@@ -658,6 +657,84 @@ fi
 PATHS=("$@")
 [[ ${#PATHS[@]} -gt 0 ]] || PATHS=(".")
 
+# Page results cache: newest timestamp first, computed once per query and reused for subsequent pages.
+QUERY_CACHE_DAT=""
+QUERY_CACHE_IDX=""
+QUERY_CACHE_META=""
+if [[ "$PAGE" != "0" ]]; then
+  mkdir -p "$QUERY_CACHE_DIR" 2>/dev/null || true
+
+  QUERY_KEY="$(
+    python3 - "$PATTERN" "$FIXED_STRINGS" "$CASE_SENSITIVE" "$CHAT_KEEP_TS" "$PAGE_SIZE" "${PATHS[@]}" <<'PY'
+import hashlib, json, sys
+pat = sys.argv[1]
+fixed = int(sys.argv[2])
+case = int(sys.argv[3])
+keep_ts = int(sys.argv[4])
+page_size = int(sys.argv[5])
+roots = sys.argv[6:]
+payload = {
+  "v": 1,
+  "mode": "chat_merge_page_newest",
+  "pattern": pat,
+  "fixed": fixed,
+  "case_sensitive": case,
+  "keep_ts": keep_ts,
+  "page_size": page_size,
+  "roots": roots,
+}
+print(hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8", "surrogatepass")).hexdigest()[:20])
+PY
+  )"
+
+  QUERY_CACHE_DAT="$QUERY_CACHE_DIR/$QUERY_KEY.dat"
+  QUERY_CACHE_IDX="$QUERY_CACHE_DIR/$QUERY_KEY.idx"
+  QUERY_CACHE_META="$QUERY_CACHE_DIR/$QUERY_KEY.meta.json"
+
+  if [[ -s "$QUERY_CACHE_DAT" && -s "$QUERY_CACHE_IDX" ]]; then
+    start_ns="$(date +%s%N)"
+    python3 - "$QUERY_CACHE_DAT" "$QUERY_CACHE_IDX" "$PAGE" "$PAGE_SIZE" <<'PY'
+import struct, sys
+dat_path, idx_path, page_s, page_size_s = sys.argv[1:5]
+page = int(page_s)
+page_size = int(page_size_s)
+start = (page - 1) * page_size
+end = start + page_size
+
+with open(idx_path, "rb") as f:
+  idx = f.read()
+
+count = len(idx) // 8
+if count <= 0:
+  sys.exit(0)
+
+start = max(0, min(start, count))
+end = max(0, min(end, count))
+if start >= end:
+  sys.exit(0)
+
+offs = [struct.unpack_from("<Q", idx, i * 8)[0] for i in range(start, end + 1)]
+with open(dat_path, "rb") as f:
+  for i in range(end - start):
+    a = offs[i]
+    b = offs[i + 1]
+    if b < a:
+      continue
+    f.seek(a)
+    sys.stdout.buffer.write(f.read(b - a))
+PY
+    end_ns="$(date +%s%N)"
+    python3 - <<PY
+start = int("$start_ns")
+end = int("$end_ns")
+elapsed = max(0, end - start)
+print(f"Time taken: {elapsed / 1_000_000_000:.3f}s")
+PY
+    echo "Search exit code (overall): 0"
+    exit 0
+  fi
+fi
+
 if [[ "$FIXED_STRINGS" -eq 1 ]]; then
   RG_COMMON=(--fixed-strings)
 else
@@ -747,11 +824,15 @@ before_to_line_start = (len(sys.argv) > 10 and sys.argv[10] == "1")
 merge_mode = (len(sys.argv) > 11 and sys.argv[11] == "1")
 page = int(sys.argv[12]) if len(sys.argv) > 12 else 0
 page_size = int(sys.argv[13]) if len(sys.argv) > 13 else 10
+query_cache_dat = sys.argv[14] if len(sys.argv) > 14 else ""
+query_cache_idx = sys.argv[15] if len(sys.argv) > 15 else ""
+query_cache_meta = sys.argv[16] if len(sys.argv) > 16 else ""
 
 page_enabled = (page > 0)
 page_size = max(1, int(page_size))
 page_start = ((page - 1) * page_size + 1) if page_enabled else 1
 page_end = (page * page_size) if page_enabled else 0
+query_cache_build = (page_enabled and bool(query_cache_dat) and bool(query_cache_idx) and chat_mode and merge_mode and before == 0 and after == 0)
 
 RED        = "\x1b[31m"
 GREEN      = "\x1b[32m"
@@ -766,6 +847,125 @@ skip_rg_path = sys.argv[9] if len(sys.argv) > 9 else ""
 skipped_rg = set()
 
 printed_chat_line_keys = set()
+query_records = {}
+
+def parse_ts_epoch(ts: str) -> int:
+  ts = (ts or "").strip()
+  if not ts:
+    return 0
+  # unix seconds/ms
+  if ts.isdigit():
+    try:
+      n = int(ts)
+      if n > 10_000_000_000:  # ms
+        return n
+      return n * 1000
+    except Exception:
+      return 0
+
+  # ISO8601-ish
+  try:
+    from datetime import datetime, timezone
+    t = ts
+    if t.endswith("Z"):
+      t = t[:-1] + "+00:00"
+    dt = datetime.fromisoformat(t)
+    if dt.tzinfo is None:
+      dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+  except Exception:
+    pass
+
+  # Fallback common formats
+  try:
+    from datetime import datetime, timezone
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+      try:
+        dt = datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+      except Exception:
+        continue
+  except Exception:
+    pass
+  return 0
+
+def _safe_unlink(path: str) -> None:
+  try:
+    if path:
+      os.unlink(path)
+  except Exception:
+    pass
+
+def _finalize_query_cache_and_print_page() -> None:
+  # records keyed by (path, ln) with fields: msg, sender, ts, ts_epoch, spans
+  items = []
+  for (p, ln), r in query_records.items():
+    items.append((int(r.get("ts_epoch", 0)), str(p), int(ln), r))
+  items.sort(key=lambda x: (-x[0], x[1], x[2]))
+
+  total = len(items)
+  # Match count file should reflect total matching messages, not just the page.
+  global match_no
+  match_no = total
+
+  # Prepare output slice.
+  start_i = max(0, (page - 1) * page_size)
+  end_i = min(total, start_i + page_size)
+
+  _safe_unlink(query_cache_dat)
+  _safe_unlink(query_cache_idx)
+
+  # idx stores (total+1) offsets so page printing can seek [i]..[i+1].
+  off = 0
+  offsets = [0]
+  try:
+    with open(query_cache_dat, "wb") as df:
+      for i, (_tse, p, ln, r) in enumerate(items, start=1):
+        msg = r.get("msg", "")
+        sender = r.get("sender", "")
+        ts = r.get("ts", "")
+        spans = r.get("spans") or []
+        if spans:
+          msg = highlight_spans(msg, spans)
+        block = (
+          f"{GREEN}{i}{RESET} {LIGHT_BLUE}{p} {ln}:{RESET}\n"
+          f"{{{msg},{sender},{ts}}}\n"
+        ).encode("utf-8", "surrogateescape")
+        if start_i <= (i - 1) < end_i and not counts_only:
+          sys.stdout.buffer.write(block)
+        df.write(block)
+        off += len(block)
+        offsets.append(off)
+
+    with open(query_cache_idx, "wb") as xf:
+      for o in offsets:
+        xf.write(int(o).to_bytes(8, "little", signed=False))
+
+    if query_cache_meta:
+      try:
+        meta = {
+          "v": 1,
+          "total": total,
+          "page_size": page_size,
+        }
+        with open(query_cache_meta, "w", encoding="utf-8") as mf:
+          json.dump(meta, mf, ensure_ascii=False)
+      except Exception:
+        pass
+  except Exception:
+    # If anything goes wrong, best-effort fallback: just print the slice.
+    if not counts_only:
+      for i, (_tse, p, ln, r) in enumerate(items, start=1):
+        if not (start_i <= (i - 1) < end_i):
+          continue
+        msg = r.get("msg", "")
+        sender = r.get("sender", "")
+        ts = r.get("ts", "")
+        spans = r.get("spans") or []
+        if spans:
+          msg = highlight_spans(msg, spans)
+        print(f"{GREEN}{i}{RESET} {LIGHT_BLUE}{p} {ln}:{RESET}")
+        print(f"{{{msg},{sender},{ts}}}")
 
 def _write_outputs():
   if skip_rg_path:
@@ -1029,9 +1229,8 @@ for raw in sys.stdin:
     skipped_rg.add(path)
     continue
 
-  # Fast path: in --chat --merge -C 0 mode, print each matching message as it arrives.
-  # This avoids per-file buffering and improves time-to-first-result, and enables early exit for --page.
-  if typ == "match" and chat_mode and merge_mode and before == 0 and after == 0:
+  # In --chat --merge -C 0 --page mode, collect matching messages for newest-timestamp paging + cache write.
+  if query_cache_build and typ == "match":
     line_no = data.get("line_number")
     text = data.get("lines", {}).get("text", "")
     if line_no is None:
@@ -1050,35 +1249,47 @@ for raw in sys.stdin:
       pass
 
     key = (path, ln)
-    if key in printed_chat_line_keys:
-      continue
-    printed_chat_line_keys.add(key)
+    rec = query_records.get(key)
+    if rec is None:
+      rec = {
+        "msg": msg,
+        "sender": sender,
+        "ts": ts,
+        "ts_epoch": parse_ts_epoch(ts),
+        "spans": [],
+      }
+      query_records[key] = rec
+    else:
+      # Keep the newest timestamp observed for the line.
+      te = parse_ts_epoch(ts)
+      if te > int(rec.get("ts_epoch", 0) or 0):
+        rec["ts_epoch"] = te
+        rec["ts"] = ts
+      # Prefer non-empty sender if we learn it later.
+      if sender and not rec.get("sender"):
+        rec["sender"] = sender
 
-    match_no += 1
-    if page_enabled and match_no < page_start:
-      continue
-
-    if not counts_only:
+    spans = rec.get("spans")
+    if spans is None:
       spans = []
-      for sub in data.get("submatches", []):
-        try:
-          sb = int(sub.get("start", 0)) - int(prefix_b or 0)
-          eb = int(sub.get("end", 0)) - int(prefix_b or 0)
-        except Exception:
-          continue
-        if eb <= 0:
-          continue
-        if sb < 0:
-          sb = 0
-        if sb == eb:
-          continue
-        spans.append((sb, eb))
-      out_msg = highlight_spans(msg, spans) if spans else msg
-      print(f"{GREEN}{match_no}{RESET} {LIGHT_BLUE}{path} {ln}:{RESET}")
-      print(f"{{{out_msg},{sender},{ts}}}")
+      rec["spans"] = spans
+    for sub in data.get("submatches", []):
+      try:
+        sb = int(sub.get("start", 0)) - int(prefix_b or 0)
+        eb = int(sub.get("end", 0)) - int(prefix_b or 0)
+      except Exception:
+        continue
+      if eb <= 0:
+        continue
+      if sb < 0:
+        sb = 0
+      if sb == eb:
+        continue
+      spans.append((sb, eb))
+    continue
 
-    if page_enabled and match_no >= page_end:
-      _finish_and_exit()
+  if query_cache_build:
+    # In query-cache build mode we only need match events; other events are ignored.
     continue
 
   if typ == "begin":
@@ -1251,6 +1462,9 @@ for raw in sys.stdin:
     if matches:
       match_files[path] = len(matches)
     files.pop(path, None)
+
+if query_cache_build:
+  _finalize_query_cache_and_print_page()
 
 _write_outputs()
 PY
@@ -3119,7 +3333,7 @@ RG_DOC=()
 
   echo "$warn_groups" >"$tmp_rc2"
   exit 0
-) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$COUNTS_ONLY" "$tmp_chat" "$tmp_skip_rg" "$BEFORE_TO_LINE_START" "$MERGE_MODE" "$PAGE" "$PAGE_SIZE"
+) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$COUNTS_ONLY" "$tmp_chat" "$tmp_skip_rg" "$BEFORE_TO_LINE_START" "$MERGE_MODE" "$PAGE" "$PAGE_SIZE" "$QUERY_CACHE_DAT" "$QUERY_CACHE_IDX" "$QUERY_CACHE_META"
 
 end_ns="$(date +%s%N)"
 
