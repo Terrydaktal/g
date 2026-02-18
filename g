@@ -12,7 +12,7 @@ CHAT_MODE=0
 CHAT_KEEP_TS=1
 CHAT_PREFILTER="${G_CHAT_PREFILTER:-1}"
 CHAT_CACHE_DIR=""
-CHAT_LINES_ONLY=0
+MERGE_MODE=0
 PAGE=0
 PAGE_SIZE=10
 ALLOW_BROKEN_PIPE=0
@@ -108,8 +108,9 @@ Options:
   -v             verbose (end-of-run per-extension scan summary)
   --chat         search chat exports only (in chat mode -B/-A/-C are numeric message counts)
   --chat-cache[=DIR]  cache parsed chat text for repeated --chat searches (default: /tmp/g_chat_cache)
-  --chat-lines   (chat-only) print each matching message once (no chat context; overrides -B/-A/-C)
-  --page N       (chat-only, requires --chat-lines) show only page N (default page-size 10); stops search early
+  --merge        (chat-only) merge repeated hits in the same message; output 1 block per matching message (format like -C 0)
+                (deprecated alias: --chat-lines)
+  --page N       (chat-only, requires --merge and -C 0) show only page N (default page-size 10); stops search early
   --page-size N  (chat-only) page size for --page (default 10)
   --chat-ts=VAL  keep (keep) or drop (drop) timestamps in chat output (default: keep)
   --chat-prefilter    prefilter chat files with raw rg before parsing (default: on)
@@ -201,7 +202,8 @@ for idx in "${!args[@]}"; do
 	      CHAT_CACHE_DIR="${arg#*=}"
 	      [[ -z "$CHAT_CACHE_DIR" ]] && CHAT_CACHE_DIR="/tmp/g_chat_cache"
 	      continue ;;
-	    --chat-lines) CHAT_LINES_ONLY=1; continue ;;
+	    --merge) MERGE_MODE=1; continue ;;
+	    --chat-lines) MERGE_MODE=1; continue ;;
 	    --page)
 	      PAGE="${args[$((idx + 1))]:-}"
 	      skip_next=1
@@ -345,14 +347,15 @@ while getopts ":B:A:C:vhul-:" opt; do
 	        chat-prefilter) CHAT_PREFILTER=1 ;;
 	        no-chat-prefilter) CHAT_PREFILTER=0 ;;
 	        chat-cache) CHAT_CACHE_DIR="/tmp/g_chat_cache" ;;
-	        chat-cache=*)
-	          CHAT_CACHE_DIR="${OPTARG#*=}"
-	          [[ -z "$CHAT_CACHE_DIR" ]] && CHAT_CACHE_DIR="/tmp/g_chat_cache"
-	          ;;
-		        chat-lines) CHAT_LINES_ONLY=1 ;;
-		        chat-prefilter=*)
-		          val="${OPTARG#*=}"
-		          case "$val" in
+		        chat-cache=*)
+		          CHAT_CACHE_DIR="${OPTARG#*=}"
+		          [[ -z "$CHAT_CACHE_DIR" ]] && CHAT_CACHE_DIR="/tmp/g_chat_cache"
+		          ;;
+			        merge) MERGE_MODE=1 ;;
+			        chat-lines) MERGE_MODE=1 ;;
+			        chat-prefilter=*)
+			          val="${OPTARG#*=}"
+			          case "$val" in
 	            1|true|yes|on) CHAT_PREFILTER=1 ;;
             0|false|no|off) CHAT_PREFILTER=0 ;;
             *) echo "Error: unknown value for --chat-prefilter (use on|off)" >&2; usage; exit 2 ;;
@@ -389,8 +392,8 @@ if [[ "$CHAT_MODE" -eq 1 && "$BEFORE_TO_LINE_START" -eq 1 ]]; then
 fi
 
 if [[ "$PAGE" != "0" ]]; then
-  if [[ "$CHAT_MODE" -ne 1 || "$CHAT_LINES_ONLY" -ne 1 ]]; then
-    echo "Error: --page requires --chat --chat-lines" >&2
+  if [[ "$CHAT_MODE" -ne 1 || "$MERGE_MODE" -ne 1 ]]; then
+    echo "Error: --page requires --chat --merge" >&2
     exit 2
   fi
   if [[ "$COUNTS_ONLY" -eq 1 ]]; then
@@ -403,6 +406,10 @@ if [[ "$PAGE" != "0" ]]; then
   fi
   if ! [[ "$PAGE_SIZE" =~ ^[0-9]+$ ]] || [[ "$PAGE_SIZE" -lt 1 ]]; then
     echo "Error: --page-size must be an integer >= 1" >&2
+    exit 2
+  fi
+  if [[ "$BEFORE" -ne 0 || "$AFTER" -ne 0 ]]; then
+    echo "Error: --page requires -C 0 (or -B 0 -A 0) so it can stop early after printing a page." >&2
     exit 2
   fi
   ALLOW_BROKEN_PIPE=1
@@ -473,7 +480,7 @@ FD_EXCLUDE_PATTERNS=(
 # - non-chat mode uses extra slack so snippet extraction can span multiple lines.
 # - chat mode should be tight, otherwise every match carries huge context payload.
 if [[ "$CHAT_MODE" -eq 1 ]]; then
-  if [[ "$CHAT_LINES_ONLY" -eq 1 ]]; then
+  if [[ "$MERGE_MODE" -eq 1 && "$BEFORE" -eq 0 && "$AFTER" -eq 0 ]]; then
     CTX_LINES=0
   else
     CTX_LINES=$(( BEFORE > AFTER ? BEFORE : AFTER ))
@@ -737,7 +744,7 @@ match_files_path = sys.argv[5] if len(sys.argv) > 5 else ""
 chat_mode = (len(sys.argv) > 6 and sys.argv[6] == "1")
 counts_only = (len(sys.argv) > 7 and sys.argv[7] == "1")
 before_to_line_start = (len(sys.argv) > 10 and sys.argv[10] == "1")
-chat_lines_only = (len(sys.argv) > 11 and sys.argv[11] == "1")
+merge_mode = (len(sys.argv) > 11 and sys.argv[11] == "1")
 page = int(sys.argv[12]) if len(sys.argv) > 12 else 0
 page_size = int(sys.argv[13]) if len(sys.argv) > 13 else 10
 
@@ -1022,9 +1029,9 @@ for raw in sys.stdin:
     skipped_rg.add(path)
     continue
 
-  # Fast path: in --chat --chat-lines mode, print each matching message line as it arrives.
+  # Fast path: in --chat --merge -C 0 mode, print each matching message as it arrives.
   # This avoids per-file buffering and improves time-to-first-result, and enables early exit for --page.
-  if typ == "match" and chat_mode and chat_lines_only:
+  if typ == "match" and chat_mode and merge_mode and before == 0 and after == 0:
     line_no = data.get("line_number")
     text = data.get("lines", {}).get("text", "")
     if line_no is None:
@@ -1067,8 +1074,8 @@ for raw in sys.stdin:
           continue
         spans.append((sb, eb))
       out_msg = highlight_spans(msg, spans) if spans else msg
-      ts_prefix = f"{ts} | " if ts else ""
-      print(f"{GREEN}{match_no}{RESET} {LIGHT_BLUE}{path} {ln}:{RESET} {ts_prefix}{sender}: {out_msg}")
+      print(f"{GREEN}{match_no}{RESET} {LIGHT_BLUE}{path} {ln}:{RESET}")
+      print(f"{{{out_msg},{sender},{ts}}}")
 
     if page_enabled and match_no >= page_end:
       _finish_and_exit()
@@ -1147,20 +1154,30 @@ for raw in sys.stdin:
       if prefix_b and m["start_b"] < prefix_b:
         continue
       mtxt = m.get("mtxt", "")
-      if chat_mode and ln in chat_lines and chat_lines_only:
+      if chat_mode and ln in chat_lines and merge_mode:
         if ln in printed_chat_lines:
           continue
         printed_chat_lines.add(ln)
+        start_ln = ln - before
+        end_ln = ln + after
+        match_no += 1
         if not counts_only:
-          msg = lines_map.get(ln, "")
-          spans = chat_spans.get(ln)
-          if spans:
-            msg = highlight_spans(msg, spans)
-          sender = sender_map.get(ln, "")
-          ts = ts_map.get(ln, "")
-          ts_prefix = f"{ts} | " if ts else ""
-          match_no += 1
-          print(f"{GREEN}{match_no}{RESET} {LIGHT_BLUE}{path} {ln}:{RESET} {ts_prefix}{sender}: {msg}")
+          print(f"{GREEN}{match_no}{RESET} {LIGHT_BLUE}{path} {ln}:{RESET}")
+          for n in all_line_nos:
+            if n < start_ln or n > end_ln:
+              continue
+            msg = lines_map.get(n, "")
+            spans = chat_spans.get(n)
+            if spans:
+              msg = highlight_spans(msg, spans)
+            sender = sender_map.get(n, "")
+            ts = ts_map.get(n, "")
+            print(f"{{{msg},{sender},{ts}}}")
+          max_ln = max(all_line_nos) if all_line_nos else 0
+          missing_after = max(0, end_ln - max_ln)
+          if missing_after:
+            for msg, sender, ts in read_next_chat_lines(path, missing_after):
+              print(f"{{{msg},{sender},{ts}}}")
         continue
 
       if chat_mode and ln in chat_lines:
@@ -3102,7 +3119,7 @@ RG_DOC=()
 
   echo "$warn_groups" >"$tmp_rc2"
   exit 0
-) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$COUNTS_ONLY" "$tmp_chat" "$tmp_skip_rg" "$BEFORE_TO_LINE_START" "$CHAT_LINES_ONLY" "$PAGE" "$PAGE_SIZE"
+) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$COUNTS_ONLY" "$tmp_chat" "$tmp_skip_rg" "$BEFORE_TO_LINE_START" "$MERGE_MODE" "$PAGE" "$PAGE_SIZE"
 
 end_ns="$(date +%s%N)"
 
