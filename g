@@ -23,6 +23,7 @@ NOCHAT=0
 
 QUERY_CACHE_DIR="/tmp/g_chat_query_cache"
 QUERY_CACHE_KEEP="${G_CHAT_QUERY_CACHE_KEEP:-10}"
+QUERY_CACHE_VERSION=2
 
 SEARCH_HIDDEN=0
 SEARCH_UUU=0
@@ -119,7 +120,7 @@ Options:
                 (deprecated alias: --chat-lines)
   --no-norm      (chat-only) preserve message whitespace/newlines by emitting literal \\n/\\t escapes instead of collapsing
   --page N       (chat-only, requires --merge and -C 0) show page N ordered by newest timestamp (default page-size 10)
-                first run scans and caches results; subsequent pages reuse /tmp/g_chat_query_cache
+                page 1 rebuilds cache; page 2+ reuses validated cache in /tmp/g_chat_query_cache
   --page-size N  (chat-only) page size for --page (default 10)
   --chat-ts=VAL  keep (keep) or drop (drop) timestamps in chat output (default: keep)
   --chat-prefilter    prefilter chat files with raw rg before parsing (default: on)
@@ -787,27 +788,31 @@ PATHS=("$@")
 QUERY_CACHE_DAT=""
 QUERY_CACHE_IDX=""
 QUERY_CACHE_META=""
+QUERY_KEY=""
  if [[ "$PAGE" != "0" ]]; then
   mkdir -p "$QUERY_CACHE_DIR" 2>/dev/null || true
 
   QUERY_KEY="$(
-    python3 - "$PATTERN" "$FIXED_STRINGS" "$CASE_SENSITIVE" "$CHAT_KEEP_TS" "$CHAT_NO_NORM" "$PAGE_SIZE" "${PATHS[@]}" <<'PY'
+    python3 - "$PATTERN" "$FIXED_STRINGS" "$CASE_SENSITIVE" "$CHAT_KEEP_TS" "$CHAT_NO_NORM" "$CHAT_PREFILTER" "$PAGE_SIZE" "$QUERY_CACHE_VERSION" "${PATHS[@]}" <<'PY'
 import hashlib, json, sys
 pat = sys.argv[1]
 fixed = int(sys.argv[2])
 case = int(sys.argv[3])
 keep_ts = int(sys.argv[4])
 no_norm = int(sys.argv[5])
-page_size = int(sys.argv[6])
-roots = sys.argv[7:]
+chat_prefilter = int(sys.argv[6])
+page_size = int(sys.argv[7])
+cache_version = int(sys.argv[8])
+roots = sys.argv[9:]
 payload = {
-  "v": 1,
+  "v": cache_version,
   "mode": "chat_merge_page_newest",
   "pattern": pat,
   "fixed": fixed,
   "case_sensitive": case,
   "keep_ts": keep_ts,
   "no_norm": no_norm,
+  "chat_prefilter": chat_prefilter,
   "page_size": page_size,
   "roots": roots,
 }
@@ -819,51 +824,101 @@ PY
   QUERY_CACHE_IDX="$QUERY_CACHE_DIR/$QUERY_KEY.idx"
   QUERY_CACHE_META="$QUERY_CACHE_DIR/$QUERY_KEY.meta.json"
 
-  if [[ -s "$QUERY_CACHE_DAT" && -s "$QUERY_CACHE_IDX" ]]; then
+  if [[ "$PAGE" != "1" && -s "$QUERY_CACHE_DAT" && -s "$QUERY_CACHE_IDX" && -s "$QUERY_CACHE_META" ]]; then
     # Update recency for LRU pruning.
     touch -c "$QUERY_CACHE_META" 2>/dev/null || true
     prune_query_cache "$QUERY_CACHE_DIR" "$QUERY_CACHE_KEEP"
 
     start_ns="$(date +%s%N)"
-    python3 - "$QUERY_CACHE_DAT" "$QUERY_CACHE_IDX" "$PAGE" "$PAGE_SIZE" <<'PY'
-import struct, sys
-dat_path, idx_path, page_s, page_size_s = sys.argv[1:5]
+    if python3 - "$QUERY_CACHE_DAT" "$QUERY_CACHE_IDX" "$QUERY_CACHE_META" "$QUERY_KEY" "$QUERY_CACHE_VERSION" "$PAGE" "$PAGE_SIZE" <<'PY'
+import json, os, struct, sys
+dat_path, idx_path, meta_path, query_key, cache_version_s, page_s, page_size_s = sys.argv[1:8]
+cache_version = int(cache_version_s)
 page = int(page_s)
 page_size = int(page_size_s)
+
+try:
+  with open(meta_path, "r", encoding="utf-8", errors="replace") as mf:
+    meta = json.load(mf)
+except Exception:
+  sys.exit(3)
+
+if not isinstance(meta, dict):
+  sys.exit(3)
+if int(meta.get("v", -1)) != cache_version:
+  sys.exit(3)
+if str(meta.get("key", "")) != query_key:
+  sys.exit(3)
+
+try:
+  total = int(meta.get("total", -1))
+except Exception:
+  sys.exit(3)
+if total < 0:
+  sys.exit(3)
+
+try:
+  idx_size = os.path.getsize(idx_path)
+  dat_size = os.path.getsize(dat_path)
+except Exception:
+  sys.exit(3)
+
+expected_idx_size = (total + 1) * 8
+if idx_size != expected_idx_size:
+  sys.exit(3)
+
+try:
+  with open(idx_path, "rb") as f:
+    idx = f.read()
+except Exception:
+  sys.exit(3)
+if len(idx) != expected_idx_size:
+  sys.exit(3)
+
+offs = []
+for i in range(total + 1):
+  try:
+    offs.append(struct.unpack_from("<Q", idx, i * 8)[0])
+  except Exception:
+    sys.exit(3)
+if not offs or offs[0] != 0:
+  sys.exit(3)
+if offs[-1] != dat_size:
+  sys.exit(3)
+for i in range(total):
+  if offs[i + 1] < offs[i]:
+    sys.exit(3)
+
 start = (page - 1) * page_size
 end = start + page_size
-
-with open(idx_path, "rb") as f:
-  idx = f.read()
-
-count = len(idx) // 8
-if count <= 0:
-  sys.exit(0)
-
-start = max(0, min(start, count))
-end = max(0, min(end, count))
+start = max(0, min(start, total))
+end = max(0, min(end, total))
 if start >= end:
   sys.exit(0)
 
-offs = [struct.unpack_from("<Q", idx, i * 8)[0] for i in range(start, end + 1)]
 with open(dat_path, "rb") as f:
-  for i in range(end - start):
+  for i in range(start, end):
     a = offs[i]
     b = offs[i + 1]
     if b < a:
-      continue
+      sys.exit(3)
     f.seek(a)
     sys.stdout.buffer.write(f.read(b - a))
+sys.exit(0)
 PY
-    end_ns="$(date +%s%N)"
-    python3 - <<PY
+    then
+      end_ns="$(date +%s%N)"
+      python3 - <<PY
 start = int("$start_ns")
 end = int("$end_ns")
 elapsed = max(0, end - start)
 print(f"Time taken: {elapsed / 1_000_000_000:.3f}s")
 PY
-    echo "Search exit code (overall): 0"
-    exit 0
+      echo "Search exit code (overall): 0"
+      exit 0
+    else
+      [[ "$VERBOSE" -eq 1 ]] && echo "[g] cache invalid/mismatched for key=$QUERY_KEY; rebuilding page cache from source" >&2
+    fi
   fi
 fi
 
@@ -959,12 +1014,14 @@ page_size = int(sys.argv[13]) if len(sys.argv) > 13 else 10
 query_cache_dat = sys.argv[14] if len(sys.argv) > 14 else ""
 query_cache_idx = sys.argv[15] if len(sys.argv) > 15 else ""
 query_cache_meta = sys.argv[16] if len(sys.argv) > 16 else ""
+query_cache_key = sys.argv[17] if len(sys.argv) > 17 else ""
+query_cache_version = int(sys.argv[18]) if len(sys.argv) > 18 else 1
 
 page_enabled = (page > 0)
 page_size = max(1, int(page_size))
 page_start = ((page - 1) * page_size + 1) if page_enabled else 1
 page_end = (page * page_size) if page_enabled else 0
-query_cache_build = (page_enabled and bool(query_cache_dat) and bool(query_cache_idx) and chat_mode and merge_mode and before == 0 and after == 0)
+query_cache_build = (page_enabled and bool(query_cache_dat) and bool(query_cache_idx) and bool(query_cache_meta) and chat_mode and merge_mode and before == 0 and after == 0)
 
 RED        = "\x1b[31m"
 GREEN      = "\x1b[32m"
@@ -1055,14 +1112,14 @@ def _finalize_query_cache_and_print_page() -> None:
   start_i = max(0, (page - 1) * page_size)
   end_i = min(total, start_i + page_size)
 
-  _safe_unlink(query_cache_dat)
-  _safe_unlink(query_cache_idx)
-
   # idx stores (total+1) offsets so page printing can seek [i]..[i+1].
   off = 0
   offsets = [0]
+  dat_tmp = (query_cache_dat + ".tmp") if query_cache_dat else ""
+  idx_tmp = (query_cache_idx + ".tmp") if query_cache_idx else ""
+  meta_tmp = (query_cache_meta + ".tmp") if query_cache_meta else ""
   try:
-    with open(query_cache_dat, "wb") as df:
+    with open(dat_tmp, "wb") as df:
       for i, (_tse, p, ln, r) in enumerate(items, start=1):
         msg = r.get("msg", "")
         sender = r.get("sender", "")
@@ -1080,22 +1137,25 @@ def _finalize_query_cache_and_print_page() -> None:
         off += len(block)
         offsets.append(off)
 
-    with open(query_cache_idx, "wb") as xf:
+    with open(idx_tmp, "wb") as xf:
       for o in offsets:
         xf.write(int(o).to_bytes(8, "little", signed=False))
 
-    if query_cache_meta:
-      try:
-        meta = {
-          "v": 1,
-          "total": total,
-          "page_size": page_size,
-        }
-        with open(query_cache_meta, "w", encoding="utf-8") as mf:
-          json.dump(meta, mf, ensure_ascii=False)
-      except Exception:
-        pass
+    meta = {
+      "v": query_cache_version,
+      "key": query_cache_key,
+      "total": total,
+      "page_size": page_size,
+    }
+    with open(meta_tmp, "w", encoding="utf-8") as mf:
+      json.dump(meta, mf, ensure_ascii=False)
+
+    os.replace(dat_tmp, query_cache_dat)
+    os.replace(idx_tmp, query_cache_idx)
+    os.replace(meta_tmp, query_cache_meta)
   except Exception:
+    for p in (dat_tmp, idx_tmp, meta_tmp):
+      _safe_unlink(p)
     # If anything goes wrong, best-effort fallback: just print the slice.
     if not counts_only:
       for i, (_tse, p, ln, r) in enumerate(items, start=1):
@@ -3502,7 +3562,7 @@ RG_DOC=()
 
   echo "$warn_groups" >"$tmp_rc2"
   exit 0
-) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$COUNTS_ONLY" "$tmp_chat" "$tmp_skip_rg" "$BEFORE_TO_LINE_START" "$MERGE_MODE" "$PAGE" "$PAGE_SIZE" "$QUERY_CACHE_DAT" "$QUERY_CACHE_IDX" "$QUERY_CACHE_META"
+) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$COUNTS_ONLY" "$tmp_chat" "$tmp_skip_rg" "$BEFORE_TO_LINE_START" "$MERGE_MODE" "$PAGE" "$PAGE_SIZE" "$QUERY_CACHE_DAT" "$QUERY_CACHE_IDX" "$QUERY_CACHE_META" "$QUERY_KEY" "$QUERY_CACHE_VERSION"
 
 end_ns="$(date +%s%N)"
 
