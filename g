@@ -12,6 +12,7 @@ CHAT_MODE=0
 CHAT_KEEP_TS=1
 CHAT_PREFILTER="${G_CHAT_PREFILTER:-1}"
 CHAT_CACHE_DIR=""
+CHAT_LINES_ONLY=0
 NOCHAT=0
 
 SEARCH_HIDDEN=0
@@ -104,6 +105,7 @@ Options:
   -v             verbose (end-of-run per-extension scan summary)
   --chat         search chat exports only (in chat mode -B/-A/-C are numeric message counts)
   --chat-cache[=DIR]  cache parsed chat text for repeated --chat searches (default: /tmp/g_chat_cache)
+  --chat-lines   (chat-only) print each matching message once (no chat context; overrides -B/-A/-C)
   --chat-ts=VAL  keep (keep) or drop (drop) timestamps in chat output (default: keep)
   --chat-prefilter    prefilter chat files with raw rg before parsing (default: on)
   --no-chat-prefilter disable chat prefilter
@@ -194,6 +196,7 @@ for idx in "${!args[@]}"; do
       CHAT_CACHE_DIR="${arg#*=}"
       [[ -z "$CHAT_CACHE_DIR" ]] && CHAT_CACHE_DIR="/tmp/g_chat_cache"
       continue ;;
+    --chat-lines) CHAT_LINES_ONLY=1; continue ;;
     --chat-prefilter=*)
       val="${arg#*=}"
       case "$val" in
@@ -327,6 +330,7 @@ while getopts ":B:A:C:vhul-:" opt; do
 	          CHAT_CACHE_DIR="${OPTARG#*=}"
 	          [[ -z "$CHAT_CACHE_DIR" ]] && CHAT_CACHE_DIR="/tmp/g_chat_cache"
 	          ;;
+	        chat-lines) CHAT_LINES_ONLY=1 ;;
 	        chat-prefilter=*)
 	          val="${OPTARG#*=}"
 	          case "$val" in
@@ -430,7 +434,11 @@ FD_EXCLUDE_PATTERNS=(
 # - non-chat mode uses extra slack so snippet extraction can span multiple lines.
 # - chat mode should be tight, otherwise every match carries huge context payload.
 if [[ "$CHAT_MODE" -eq 1 ]]; then
-  CTX_LINES=$(( BEFORE > AFTER ? BEFORE : AFTER ))
+  if [[ "$CHAT_LINES_ONLY" -eq 1 ]]; then
+    CTX_LINES=0
+  else
+    CTX_LINES=$(( BEFORE > AFTER ? BEFORE : AFTER ))
+  fi
 else
   CTX_LINES=$((BEFORE + AFTER + 20))
 fi
@@ -677,7 +685,10 @@ trap cleanup EXIT
 # Formatter: prints matches and writes match_count
 cat >"$tmp_fmt" <<'PY'
 import json, re, sys, os, subprocess, html
+import signal
 from html.parser import HTMLParser
+
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 before = int(sys.argv[1])
 after  = int(sys.argv[2])
@@ -687,6 +698,7 @@ match_files_path = sys.argv[5] if len(sys.argv) > 5 else ""
 chat_mode = (len(sys.argv) > 6 and sys.argv[6] == "1")
 counts_only = (len(sys.argv) > 7 and sys.argv[7] == "1")
 before_to_line_start = (len(sys.argv) > 10 and sys.argv[10] == "1")
+chat_lines_only = (len(sys.argv) > 11 and sys.argv[11] == "1")
 
 RED        = "\x1b[31m"
 GREEN      = "\x1b[32m"
@@ -996,6 +1008,7 @@ for raw in sys.stdin:
           continue
         chat_spans.setdefault(ln, []).append((start_b, end_b))
 
+    printed_chat_lines = set()
     for m in matches:
       ln = m["line_no"]
       if ln is None:
@@ -1006,6 +1019,22 @@ for raw in sys.stdin:
       if prefix_b and m["start_b"] < prefix_b:
         continue
       mtxt = m.get("mtxt", "")
+      if chat_mode and ln in chat_lines and chat_lines_only:
+        if ln in printed_chat_lines:
+          continue
+        printed_chat_lines.add(ln)
+        if not counts_only:
+          msg = lines_map.get(ln, "")
+          spans = chat_spans.get(ln)
+          if spans:
+            msg = highlight_spans(msg, spans)
+          sender = sender_map.get(ln, "")
+          ts = ts_map.get(ln, "")
+          ts_prefix = f"{ts} | " if ts else ""
+          match_no += 1
+          print(f"{GREEN}{match_no}{RESET} {LIGHT_BLUE}{path} {ln}:{RESET} {ts_prefix}{sender}: {msg}")
+        continue
+
       if chat_mode and ln in chat_lines:
         start_ln = ln - before
         end_ln = ln + after
@@ -2949,7 +2978,7 @@ RG_DOC=()
 
   echo "$warn_groups" >"$tmp_rc2"
   exit 0
-) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$COUNTS_ONLY" "$tmp_chat" "$tmp_skip_rg" "$BEFORE_TO_LINE_START"
+) | python3 "$tmp_fmt" "$BEFORE" "$AFTER" "$CTX_LINES" "$tmp_mc" "$MATCH_FILES_PERSIST" "$CHAT_MODE" "$COUNTS_ONLY" "$tmp_chat" "$tmp_skip_rg" "$BEFORE_TO_LINE_START" "$CHAT_LINES_ONLY"
 
 end_ns="$(date +%s%N)"
 
