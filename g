@@ -15,6 +15,7 @@ CHAT_CACHE_DIR="/tmp/g_chat_cache"
 CHAT_CACHE_KEEP="${G_CHAT_CACHE_KEEP:-0}"
 CHAT_CACHE_MAX_MB="${G_CHAT_CACHE_MAX_MB:-300}"
 CHAT_NO_NORM=0
+CHAT_NO_TOOLS=0
 MERGE_MODE=0
 PAGE=0
 PAGE_SIZE=10
@@ -119,6 +120,7 @@ Options:
   --merge        (chat-only) merge repeated hits in the same message; output 1 block per matching message (format like -C 0)
                 (deprecated alias: --chat-lines)
   --no-norm      (chat-only) preserve message whitespace/newlines by emitting literal \\n/\\t escapes instead of collapsing
+  --chat-no-tools (chat-only) drop likely tool-call payload messages and keep user/assistant chat turns
   --page N       (chat-only, requires --merge and -C 0) show page N ordered by newest timestamp (default page-size 10)
                 page 1 rebuilds cache; page 2+ reuses validated cache in /tmp/g_chat_query_cache
   --page-size N  (chat-only) page size for --page (default 10)
@@ -322,6 +324,7 @@ for idx in "${!args[@]}"; do
     --case-sensitive) CASE_SENSITIVE=1; continue ;;
     --literal) FIXED_STRINGS=1; continue ;;
     --no-norm) CHAT_NO_NORM=1; continue ;;
+    --chat-no-tools) CHAT_NO_TOOLS=1; continue ;;
     --chat-prefilter) CHAT_PREFILTER=1; continue ;;
     --no-chat-prefilter) CHAT_PREFILTER=0; continue ;;
     --chat-cache|--chat-cache=*)
@@ -470,6 +473,7 @@ while getopts ":B:A:C:vhul-:" opt; do
         counts) COUNTS_ONLY=1 ;;
         case-sensitive) CASE_SENSITIVE=1 ;;
         no-norm) CHAT_NO_NORM=1 ;;
+        chat-no-tools) CHAT_NO_TOOLS=1 ;;
         chat-prefilter) CHAT_PREFILTER=1 ;;
         no-chat-prefilter) CHAT_PREFILTER=0 ;;
         chat-cache|chat-cache=*)
@@ -546,6 +550,7 @@ if [[ "$UCOUNT" -ge 3 ]]; then SEARCH_BINARY=1; SEARCH_UUU=1; fi
 export CHAT_KEEP_TS
 export G_CHAT_CACHE_DIR="$CHAT_CACHE_DIR"
 export G_CHAT_NO_NORM="$CHAT_NO_NORM"
+export G_CHAT_NO_TOOLS="$CHAT_NO_TOOLS"
 if [[ -n "$CHAT_CACHE_DIR" ]]; then
   mkdir -p "$CHAT_CACHE_DIR" 2>/dev/null || true
   prune_chat_cache "$CHAT_CACHE_DIR" "$CHAT_CACHE_KEEP" "$CHAT_CACHE_MAX_MB"
@@ -793,17 +798,18 @@ QUERY_KEY=""
   mkdir -p "$QUERY_CACHE_DIR" 2>/dev/null || true
 
   QUERY_KEY="$(
-    python3 - "$PATTERN" "$FIXED_STRINGS" "$CASE_SENSITIVE" "$CHAT_KEEP_TS" "$CHAT_NO_NORM" "$CHAT_PREFILTER" "$PAGE_SIZE" "$QUERY_CACHE_VERSION" "${PATHS[@]}" <<'PY'
+    python3 - "$PATTERN" "$FIXED_STRINGS" "$CASE_SENSITIVE" "$CHAT_KEEP_TS" "$CHAT_NO_NORM" "$CHAT_NO_TOOLS" "$CHAT_PREFILTER" "$PAGE_SIZE" "$QUERY_CACHE_VERSION" "${PATHS[@]}" <<'PY'
 import hashlib, json, sys
 pat = sys.argv[1]
 fixed = int(sys.argv[2])
 case = int(sys.argv[3])
 keep_ts = int(sys.argv[4])
 no_norm = int(sys.argv[5])
-chat_prefilter = int(sys.argv[6])
-page_size = int(sys.argv[7])
-cache_version = int(sys.argv[8])
-roots = sys.argv[9:]
+no_tools = int(sys.argv[6])
+chat_prefilter = int(sys.argv[7])
+page_size = int(sys.argv[8])
+cache_version = int(sys.argv[9])
+roots = sys.argv[10:]
 payload = {
   "v": cache_version,
   "mode": "chat_merge_page_newest",
@@ -812,6 +818,7 @@ payload = {
   "case_sensitive": case,
   "keep_ts": keep_ts,
   "no_norm": no_norm,
+  "no_tools": no_tools,
   "chat_prefilter": chat_prefilter,
   "page_size": page_size,
   "roots": roots,
@@ -1778,6 +1785,7 @@ CACHE_TMP_PATH = ""
 CACHE_FINAL_PATH = ""
 CACHE_META_PATH = ""
 NO_NORM = os.environ.get("G_CHAT_NO_NORM", "0").lower() in {"1", "true", "yes", "on"}
+NO_TOOLS = os.environ.get("G_CHAT_NO_TOOLS", "0").lower() in {"1", "true", "yes", "on"}
 
 def _cache_key(path: str) -> str:
   h = hashlib.sha1()
@@ -1803,6 +1811,8 @@ def _cache_meta_ok(path: str, meta: dict) -> bool:
   if bool(meta.get("keep_ts", True)) != KEEP_TS:
     return False
   if bool(meta.get("no_norm", False)) != NO_NORM:
+    return False
+  if bool(meta.get("no_tools", False)) != NO_TOOLS:
     return False
   if int(meta.get("mtime_ns", -1)) != int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))):
     return False
@@ -2300,6 +2310,31 @@ def _chatgpt_content_text(content) -> str:
     return " ".join(str(p) for p in parts if p)
   return ""
 
+def _looks_like_tool_payload_text(text: str) -> bool:
+  if not isinstance(text, str):
+    return False
+  s = text.strip()
+  if len(s) < 2 or not (s.startswith("{") and s.endswith("}")):
+    return False
+  try:
+    obj = json.loads(s)
+  except Exception:
+    return False
+  if not isinstance(obj, dict):
+    return False
+  keys = {str(k) for k in obj.keys()}
+  if "response_length" in keys:
+    return True
+  if ("recipient_name" in keys and "parameters" in keys) or ("tool_uses" in keys):
+    return True
+  if "tool_calls" in keys or "tool_call_id" in keys:
+    return True
+  toolish = {
+    "find", "open", "click", "search_query", "image_query", "weather", "sports", "finance", "time",
+    "function_call", "function", "arguments", "name", "id", "call_id", "type",
+  }
+  return bool(keys & toolish)
+
 def _emit_chatgpt_export(convs) -> bool:
   # convs: list of conversations (ChatGPT export)
   if not isinstance(convs, list) or not convs:
@@ -2347,6 +2382,12 @@ def _emit_chatgpt_export(convs) -> bool:
           text = _chatgpt_content_text(content)
           # Some exports/HTML embed HTML entities inside JSON strings.
           text = html.unescape(text or "")
+          role_l = role.lower()
+          if NO_TOOLS:
+            if role_l not in {"user", "assistant"}:
+              continue
+            if role_l == "assistant" and _looks_like_tool_payload_text(text):
+              continue
           if text and text.strip():
             emit_chat_line(ts, sender, text)
             emitted += 1
@@ -2777,6 +2818,7 @@ def main():
               "v": CACHE_VERSION,
               "keep_ts": KEEP_TS,
               "no_norm": NO_NORM,
+              "no_tools": NO_TOOLS,
               "mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))),
               "size": int(st.st_size),
             }
