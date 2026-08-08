@@ -1,0 +1,9 @@
+[package]
+name = "g"
+version = "0.4.5"
+edition = "2021"
+
+[dependencies]
+ignore = "0.4"
+regex = "1.10"
+pdf-extract = "0.7"

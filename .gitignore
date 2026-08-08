@@ -5,3 +5,9 @@ g.match_files.log
 makeup
 socialmindset
 socialmindset1
+
+
+# Added by cargo
+
+/target
+.venv
